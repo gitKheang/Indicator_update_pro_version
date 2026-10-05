@@ -1,4 +1,4 @@
-# v7 — XAUUSD Smart Trade V7.5
+# v7 — XAUUSD Smart Trade V7.6
 
 Indicator system for XAUUSD on the 5-minute chart (TradingView, Pine Script v5).
 
@@ -6,16 +6,16 @@ Indicator system for XAUUSD on the 5-minute chart (TradingView, Pine Script v5).
 
 | File | Name on TradingView | What it does |
 |---|---|---|
-| `1 Brain - Signal Engine.pine` | XAUUSD Smart Trade V7.5 — 1. Signal Engine (Brain) | Decides every trade (details below). Sends the trade to the Trade Manager through ten hidden `BRIDGE_*` plots, and shows a status table and the decision levels on the chart |
-| `2 Execution - Trade Manager.pine` | XAUUSD Smart Trade V7.5 — 2. Trade Manager (Execution) | Runs each trade with your win/loss rule (details below). Draws entry/SL/TP lines and result labels, and keeps the scoreboard and alerts |
-| `3 Strategy Tester.pine` | XAUUSD Smart Trade V7.5 — 3. Strategy Tester | The Signal Engine logic as a `strategy()` for TradingView's Strategy Tester: same rules, fixed $ risk per trade, costs included. Needs no link to another indicator |
+| `1 Brain - Signal Engine.pine` | XAUUSD Smart Trade — 1. Signal Engine (Brain) | Decides every trade (details below). Sends the trade to the Trade Manager through ten hidden `BRIDGE_*` plots, and shows a status table and the decision levels on the chart |
+| `2 Execution - Trade Manager.pine` | XAUUSD Smart Trade — 2. Trade Manager (Execution) | Runs each trade with your win/loss rule (details below). Draws entry/SL/TP lines and result labels, and keeps the scoreboard and alerts |
+| `3 Strategy Tester.pine` | XAUUSD Smart Trade — 3. Strategy Tester | The Signal Engine logic as a `strategy()` for TradingView's Strategy Tester: same rules, fixed $ risk per trade, costs included. Needs no link to another indicator |
 | `4 Chart Overlay - SMC ICT.pine` | XAUUSD Smart Trade — 4. Chart Overlay (SMC & ICT) | Visual reference only: SMC structure, order blocks, FVGs, EQH/EQL, premium/discount, supply/demand, pivots, candle patterns and the nine-indicator direction panel. No trade decision uses it |
 | `README.md` | — | This file: rules, results, research, deployment notes and history |
 | `backtest/` | — | Python port of the system and the research scripts. Price data is downloaded locally and not stored in git |
 
 - **1. Signal Engine decides every trade:**
   - **Trend:** 4H + 1H trend must agree.
-  - **Trigger:** 5m structure break with the 5m Supertrend agreeing, plus the fast-pullback and calm-1H filters.
+  - **Trigger:** 5m structure break with the 5m Supertrend, Ichimoku Tenkan/Kijun and an RSI(14) cap agreeing, plus the fast-pullback filter (the calm-1H filter is optional).
   - **Stop:** structural, at most $15.
   - **Targets:** TP1 at 1.51R with clean room, TP2 beyond it.
 - **2. Trade Manager runs each trade:**
@@ -46,17 +46,201 @@ and the link from 2 to 1 uses it.
 
 This file has two parts:
 
-1. **Current system: V7.5** (below). The maintained logic, values, research,
-   backtest and validation as of 5 October 2026. Read this first.
-2. **Change history.** V7.4, V7.3, V7.2, V7.1, the earlier logic review, and the split,
+1. **Current system: V7.6** (below). The maintained logic, values, research,
+   backtest and validation as of 6 October 2026. Read this first.
+2. **Change history.** V7.5, V7.4, V7.3, V7.2, V7.1, the earlier logic review, and the split,
    memory, bridge and lifecycle repairs. Anything there that conflicts with
    Part 1 is superseded.
 
 ---
 
-## Part 1 — Current system: V7.5 (5 October 2026)
+## Part 1 — Current system: V7.6 (6 October 2026)
 
-### Your rules and targets
+### Your rules and targets (latest request)
+
+- SL structure-based, at most **$15**; TP1 **> 1.5R**; TP2 **> TP1**; otherwise
+  **NO TRADE**. No break-even: TP1 or TP2 = WIN, SL before TP1 = LOSS.
+- Test and tune on the **latest 6 months only**, on data that is verified.
+- Target: **at least 200 trades in those 6 months, at about 85% win rate**,
+  with logic that survives in the market (not curve-fitted).
+
+### Bottom line
+
+**The target (≥ 200 trades and ~85% in 6 months) was not reached, and nothing
+tested comes close.** The table shows the best result found at each trade
+count. Every row uses your SL/TP rules, the repaired data and the latest 6
+months: 5 April – 4 October 2026, 130 trading days. Tuning used April–July;
+August–October was held out.
+
+| Trades in 6 months | Best rule set found | Win rate |
+|---|---|---|
+| **32** | **V7.6 (shipped)** | **81.2%** (Apr–Jul 76.9%, Aug–Oct 6 of 6) |
+| 40 | V7.6 without the Ichimoku/RSI filters | 72.5% |
+| 66 | V7.3-style (no Supertrend, chop or fast filter) | 60.6% |
+| 110 | Clean room off, no chop or fast filter | 50.0% |
+| ~200–300 | Best famous-indicator systems with the trend filter (Hull turn, EMA20 pullback) | 44–45% |
+| ~300 | V7 trend stack with a 1-minute trigger | 41.9% |
+| ~1.5/day | Machine-learning pick from 49 features, on unseen Aug–Oct data | 48–52% |
+
+- **Why it can't be reached:**
+  - A trade wins only if price moves 1.5× the stop distance in your favour
+    before it touches the stop. A random entry does that about 40% of the
+    time.
+  - Every extra trade comes from a weaker setup.
+  - The oracle test showed that even perfect knowledge of the next hour's
+    direction reaches only ~72% with these stops and targets.
+- **V7.6's 81% depends on the regime.** The same rules won **55.0%** on the
+  older data (Jan 2024 – Apr 2026, 218 trades), where V7.5 won 58.5%. Expect
+  live results between those levels, depending on whether the market behaves
+  like 2026 (strong, clean trends) or like 2024–25.
+
+### V7.6 results (latest 6 months)
+
+| | V7.5 (as deployed) | **V7.6** |
+|---|---|---|
+| Trades (per day) | 24 (0.18) | **32 (0.25)** |
+| Wins / losses | 17 / 7 | **26 / 6** |
+| Win rate (Apr–Jul / Aug–Oct) | 70.8% (66.7% / 3 of 3) | **81.2% (76.9% / 6 of 6)** |
+| PF / net / expectancy | 2.87 / +13.5R / +0.56R | **5.59 / +28.3R / +0.88R** |
+| Max drawdown / longest losing streak | 2.1R / 2 | **1.0R / 1** |
+| Outcomes | 10 TP2, 7 TP1 then stop, 7 SL | 17 TP2, 9 TP1 then stop, 6 SL |
+| Older data (Jan 2024 – Apr 2026) | 217 trades, 58.5%, PF 2.17 | 218 trades, 55.0%, PF 1.83 |
+
+- **Checks on every V7.6 trade:**
+  - The largest stop was $14.70 (median $10.60).
+  - Every TP1 is 1.51R and every TP2 is beyond TP1.
+- **Direction by period:** April–July were all shorts (gold fell from 4,600
+  to 3,960); August were longs.
+- **On TradingView's own OANDA data** (9 Aug – 5 Oct, the history your plan
+  loads), the Strategy Tester and the Trade Manager both show **7 trades,
+  5 W / 2 L (71.4%), +5.95R**, $573 net at $100 risk, PF 3.24.
+
+### Data: verified and repaired
+
+The backtest data is HistData M1, which is sourced from Dukascopy.
+
+1. **Duplicated minutes.** HistData's June–September 2026 files contain
+   **774 duplicated minutes**: the same minute twice, with different prices.
+   - The loader merges them in file order: open of the first row, high/low
+     over both, close of the last row.
+   - The rule was checked against the Dukascopy original (28 Jun 2026).
+2. **A missing day.** **Friday 25 September 2026 was missing** (1,260
+   minutes). It was downloaded from Dukascopy and filled in.
+3. **Illiquid minutes removed.** OANDA does not quote the last minute before
+   the 17:00 New York close or the first four minutes after the 18:00
+   reopen, while the Dukascopy bid prints $5–17 spread spikes there. Those
+   minutes are dropped.
+4. **Check against TradingView's OANDA 5m bars** (9 Aug – 2 Oct 2026, 11,034
+   bars):
+   - Every bar is present.
+   - Time alignment is exact: the median close difference is $0.33 at zero
+     shift and $1.86 at ±1 bar.
+   - Our bid sits $0.35 below OANDA.
+   - 99% of highs are within $0.96 and 99% of lows within $1.27.
+   - The shorter sessions on 25 May, 19 Jun, 3 Jul and 7 Sep are real US
+     holidays.
+
+`backtest/data_check.py` reruns the comparison. `backtest/data/tv_oanda_5m.csv`
+holds the TradingView bars.
+
+### The external audit, claim by claim
+
+| Claim | Verified | Action | Effect (latest 6 months) |
+|---|---|---|---|
+| 4H swing treated as "unswept" after being traded through | **Real** (wrong label) | Kept as an obstacle, definition corrected: resting liquidity if untouched, flipped S/R if traded through | Treating traded-through levels as clear added 2 trades, both losses (71.8% → 68.3%) |
+| Protected extreme includes the broken pivot candle | **Real** | **Fixed**: starts the bar after the pivot (input, ON) | +1 trade (a win); older data −1.2 points |
+| $2 minimum stop | Real rule | Kept | No trade in 6 months was rejected by it |
+| Pivot freshness tracked but ignored | Real | Kept all pivot zones as obstacles | Fresh-only: 71 trades at 57.7% (vs 42 at 69%) |
+| 4H/1H bias very slow | True by design | Kept | Faster readings tested worse on 2.75 years (V7.5 notes) |
+| Order Block not "professional" | LuxAlgo's definition, display only | Unchanged | No trading effect |
+| Chart Overlay zones differ from the Brain | True, the overlay is third-party display | The Brain draws its own decision levels | — |
+| TP1 not structural | True by design (1.51R + structural veto) | Kept | Structural TP1 tested at 38% (V7.2) |
+| One position at a time | True | Kept | Overlapping trades add volume at lower win rate |
+| Strategy Tester parity unverified | Checked by diff | — | Only header, declaration, two display defaults and the order block differ |
+
+### What was tested this round (latest 6 months only)
+
+1. **Famous free indicators as complete systems**, each under your SL/TP
+   rules (`backtest/v76_families.py`). These were Supertrend flip, UT Bot,
+   Range Filter, Donchian breakout, EMA 9/21 cross, Squeeze Momentum, Connors
+   RSI(2), Bollinger re-entry, EMA20 pullback and Hull turn.
+   - **Without a trend filter:** 37–42%.
+   - **With the 4H+1H trend filter:** 34–50%. The best was Bollinger re-entry
+     at 50% on 148 trades, but only 41.5% in August–October.
+2. **Famous indicators as filters on V7.6** (`v76_famous.py`). Ichimoku
+   Tenkan/Kijun (+4.6 points) and RSI(14) not overextended (+3.2 points) were
+   the only consistent gains, and they were adopted. Stacking more filters
+   peaked at about 81% on fewer trades.
+3. **1-minute triggers under the V7 trend stack** (`v76_m1.py`): 301 trades
+   at 41.9%. The 5m edge does not carry over to 1m structure.
+4. **Machine-learning ceiling** (`v76_ml.py`): out-of-sample AUC 0.58–0.65.
+   At 1.54 trades/day (the 200-trade rate) it picks 48–52% winners.
+5. **Feature scan** (`v76_features.py`): tight structure (impulse < 2 ATR)
+   and fast pullbacks help, but they overlap with the adopted filters.
+
+### How V7.6 works
+
+```
+Trend    : 4H AND 1H major structure (50-bar LuxAlgo swings) agree
+Trigger  : 5m internal BOS/CHoCH in that direction AND
+           5m Supertrend(10, 3) agrees AND
+           Ichimoku Tenkan(9) vs Kijun(26) agrees (5m)                 <- V7.6
+           RSI(14) < 70 for longs / > 30 for shorts                    <- V7.6
+           break <= 11 bars after the broken internal pivot
+           [optional] 1H Choppiness(14) < 50 (OFF by default)          <- V7.6
+Stop     : pullback extreme from the bar AFTER the broken pivot        <- V7.6
+           +/- 0.3 x ATR(89); NO TRADE if > $15 (or < $2)
+TP1      : 1.51R, only if no obstacle before it (15m pivot S/R zones,
+           unswept 15m EQH/EQL, 4H swing level)
+TP2      : 2.5R, or 0.1 ATR before the next obstacle; must exceed TP1 + 0.25R
+Execution: 50% at TP1 = WIN; runner keeps the original SL (no break-even)
+```
+
+- **New inputs** (group *Engine 6 — Trigger*):
+  - *Require Ichimoku Tenkan/Kijun agreement* (ON);
+  - *Skip overextended entries (RSI 14)* (ON, 70/30);
+  - *Require calm 1H* (now OFF).
+- **Group *Engine 7 — Construction*:** *Protected extreme starts after the
+  broken pivot* (ON).
+- **New table row:** "Ichimoku TK / RSI(14)". "Trade side allowed now" also
+  reports "none (Ichimoku/RSI against)".
+- **Script names** on TradingView no longer carry a version: "XAUUSD Smart
+  Trade — 1. Signal Engine (Brain)" and so on. The version is in each table
+  header.
+
+### TradingView deployment (6 October 2026)
+
+- **Versions:** Signal Engine v15, Trade Manager v12, Strategy Tester v5. The
+  Chart Overlay is unchanged (v5).
+- **Updates:** each chart instance updated in place and was renamed to the
+  version-free names.
+- **Link:** the Trade Manager was re-linked to the Signal Engine
+  (`6J83Ka$0..$9`, "All 10 sources connected").
+- **Compile:** no errors.
+- **Layout:** saved as you had it (5m, your manual price range, your 5
+  drawings).
+
+### Fingerprints
+
+- `1 Brain - Signal Engine.pine`: 1,719 lines — SHA-256 `05c7f0156fd41ed91a5c3d14055806802e8abe2d8ace4ff9b9cd07001db2719f` (TradingView v15)
+- `2 Execution - Trade Manager.pine`: 303 lines — SHA-256 `d5d9d9dedfa6b3af58f1c41d2dbd59db19880de84674f3c3702be7361730261d` (TradingView v12)
+- `3 Strategy Tester.pine`: 1,820 lines — SHA-256 `4cad2fbdc96f5b67c0ce05fa099813a1efc1a80e69e8f2e717b7e811b669c442` (TradingView v5)
+- `4 Chart Overlay - SMC ICT.pine`: unchanged — SHA-256 `bbe79ea60242cb7973768d9d709dd6736023ab0761a9cf7864a2f34a3f96eb45` (TradingView v5)
+- Backtest scripts:
+  - `backtest/v76_report.py`: V7.6 and V7.5 on the latest 6 months, plus the
+    older-data check;
+  - `v76_lab.py`: setups with the audit switches;
+  - `v76_frontier.py`, `v76_combos.py`, `v76_features.py`, `v76_famous.py`,
+    `v76_families.py`, `v76_m1.py`, `v76_ml.py`;
+  - `data_check.py` and `fetch_dukascopy_days.py`: data validation and repair.
+
+---
+
+## Part 2 — Change history (superseded where it conflicts with Part 1)
+
+### V7.5 — 5 October 2026 (superseded by V7.6)
+
+#### Your rules and targets
 
 - SL is structure-based (protected swing, reaction extreme, safety buffer),
   volatility-adaptive and at most **$15** from entry; a wider structural stop
@@ -74,7 +258,7 @@ This file has two parts:
     drawdown.
   - Not by making the system so strict that it barely trades.
 
-### Bottom line
+#### Bottom line
 
 Measured on 1 Jan 2024 – 4 Oct 2026 (719 trading days), $0.30 cost per trade,
 one position at a time (as the Execution script trades):
@@ -123,7 +307,7 @@ one position at a time (as the Execution script trades):
 | Break ≤ 10 bars + calm 1H | 0.29 | 63.0% | 2.55 | +126R |
 | Break ≤ 9 bars + calm 1H + dollar index trending the same way | 0.13 | 67.0% | 2.90 | +60R |
 
-### V7.5 research round — what was tested
+#### V7.5 research round — what was tested
 
 Method: `inspect → research → modify → backtest → visual check → keep or
 revert`, every rule judged on both halves of the data (in-sample to June
@@ -184,7 +368,7 @@ revert`, every rule judged on both halves of the data (in-sample to June
    - The best 20–30% of setups won 57–63%, the same as the hand-built rules.
 7. **TP2 cap 2–4R:** net +117R to +129R with no trend, so 2.5R is kept.
 
-### Visual verification, feature by feature
+#### Visual verification, feature by feature
 
 From the live TradingView chart (5m, 5 Oct 2026) and from review charts
 rendered from the same 2024–26 data:
@@ -206,7 +390,7 @@ rendered from the same 2024–26 data:
 The "direction" panel (MACD, Stoch RSI, …) of the Visual Reference is
 display only; no decision uses it.
 
-### How V7.5 works
+#### How V7.5 works
 
 ```
 Engine 6 trigger: confirmed 5m internal break (CHoCH or BOS) with BOTH 4H and 1H bias
@@ -243,7 +427,7 @@ Execution (unchanged): 50% at TP1 (WIN); the runner keeps the original SL
   - TP1 then runner stopped +0.26R;
   - TP1 then TP2 about +1.95R.
 
-### Diagnosis: too much logic, wrong information, or a market limit?
+#### Diagnosis: too much logic, wrong information, or a market limit?
 
 From the V7.3 investigation; it still holds for V7.5.
 
@@ -280,7 +464,7 @@ Each cause was tested separately (`backtest/audit_bias.py`,
    touch, the same filters cannot separate winners from losers: models trained
    on 35 features score AUC 0.51–0.53 out-of-sample.
 
-### Research applied
+#### Research applied
 
 | Source idea | How it was tested | Result under your rules |
 |---|---|---|
@@ -292,7 +476,7 @@ Each cause was tested separately (`backtest/audit_bias.py`,
 | AOI touch, then 5m break (V7.1 style) | First zone touch, then an internal break back out | 32%, PF 0.81 (37% with 4H+1H) |
 | **Trend continuation** (pullback-end structure break in the 4H+1H trend) | V7.2/V7.3 trigger | **The only family with a consistent edge** |
 
-### Clean-room obstacle set (chosen in V7.3, unchanged since)
+#### Clean-room obstacle set (chosen in V7.3, unchanged since)
 
 Which levels block TP1, and in front of which TP2 is placed:
 
@@ -310,7 +494,7 @@ zones** (real swing turning points) and **resting liquidity** (equal
 highs/lows, the 4H swing) do stop price, so a trade that must pass through
 them before TP1 is skipped.
 
-### Iteration log (each change was kept only if it held in both halves)
+#### Iteration log (each change was kept only if it held in both halves)
 
 | # | Change tested | Result | Decision |
 |---|---|---|---|
@@ -344,7 +528,7 @@ them before TP1 is skipped.
 | 28 | ML ceiling inside the trend stack (39 features) | Out-of-sample AUC 0.55–0.59; best 20–30% of setups win 57–63% | Confirms a ceiling around 60–65% |
 | 29 | TP2 cap 2.0 / 2.5 / 3.0 / 3.5 / 4.0R | Net +117R to +129R, no trend | 2.5R kept |
 
-### Visual review
+#### Visual review
 
 Charts were rendered from the same price data (`backtest/render.py`,
 `backtest/review/*.png`):
@@ -376,7 +560,7 @@ Charts were rendered from the same price data (`backtest/render.py`,
     of the August rally are skipped: the 1H was still choppy from the
     preceding range, or the break came 12 bars after the pivot.
 
-### TradingView deployment and validation (V7.5) — 5 October 2026
+#### TradingView deployment and validation (V7.5) — 5 October 2026
 
 - **The Brain was saved as v13.** The chart's Brain instance (`6J83Ka`)
   updated in place:
@@ -396,7 +580,7 @@ Charts were rendered from the same price data (`backtest/render.py`,
   apps, so those views were not painted; the review charts cover them.
 - **Your layout was restored and saved:** 5m, your manual price range.
 
-### TradingView Strategy Tester — V7.5 Strategy Test (5 October 2026)
+#### TradingView Strategy Tester — V7.5 Strategy Test (5 October 2026)
 
 - **Script.** `3 Strategy Tester.pine` ("XAUUSD Smart Trade V7.5 — 3. Strategy
   Tester" on TradingView, chart instance `OXidda`).
@@ -435,7 +619,7 @@ Charts were rendered from the same price data (`backtest/render.py`,
   trades) is the evidence. Testing the full history on TradingView needs a
   plan with Deep Backtesting (Premium).
 
-### Fingerprints
+#### Fingerprints
 
 Renamed and re-saved on 5 October 2026, 22:12 UTC+7. Only the names, header
 descriptions and table titles changed; the trading logic is the same as V7.5
@@ -455,10 +639,6 @@ connected").
   - `v75_intermarket.py` and `fetch_hd_sym.py`: silver and dollar index;
   - `v75_bias.py`, `v75_micro.py`, `v75_entry_sl.py`, `v75_ml.py`;
   - `render75.py`: the review charts.
-
----
-
-## Part 2 — Change history (superseded where it conflicts with Part 1)
 
 ### V7.4 — 5 October 2026 (superseded by V7.5)
 

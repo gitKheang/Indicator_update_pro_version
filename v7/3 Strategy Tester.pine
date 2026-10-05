@@ -1,6 +1,6 @@
 // This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 //
-// XAUUSD SMART TRADE V7.5 — 3. STRATEGY TESTER · 5-minute chart
+// XAUUSD SMART TRADE V7.6 — 3. STRATEGY TESTER · 5-minute chart
 // For TradingView's Strategy Tester. It contains the "1. Signal Engine" logic
 // unchanged (declared as strategy(), its table and drawings off by default) plus
 // the order block at the end, so it needs no link to another indicator.
@@ -14,7 +14,7 @@
 // trades; set "Close at TP1" to 100% to make both counts the same.
 //
 //@version=5
-strategy(title="XAUUSD Smart Trade V7.5 — 3. Strategy Tester", shorttitle="3. Strategy Tester", overlay=true, max_bars_back=500,
+strategy(title="XAUUSD Smart Trade — 3. Strategy Tester", shorttitle="3. Strategy Tester", overlay=true, max_bars_back=500,
   initial_capital=10000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=1,
   pyramiding=0, process_orders_on_close=true, commission_type=strategy.commission.cash_per_contract,
   commission_value=0.15, margin_long=1, margin_short=1)
@@ -1350,6 +1350,12 @@ exec5mATRLive = phase5ExecAtrLive
 //     (E.W. Dreiss). Setups in a choppy 1H regime (>= 49) won 43.7%.
 //   Together: 52.4% -> 60.4% win rate, PF 1.65 -> 2.29, max DD 8.5R -> 4.3R,
 //   0.56 -> 0.33 trades per day; in-sample 60.1%, out-of-sample 60.9%.
+// V7.6 (tuned on the latest 6 months, 2026-04-05..2026-10-04, repaired data):
+//   * Ichimoku Tenkan/Kijun agreement and RSI(14) not overextended added;
+//     the 1H Choppiness filter is OFF by default (it removed good trades in 2026).
+//   * Result on those 6 months: 32 trades, 81.2% win rate, PF 5.59 (V7.5: 24
+//     trades, 70.8%). On older data (2024-01..2026-04) the same rules win 55.0%
+//     (V7.5: 58.5%), so the gain depends on the current market regime.
 // V7.2 removed the former AOI score/lock/touch/confirm pipeline. Measured on
 // XAUUSD 5m 2024-01..2026-10: first touches of every Phase-5 zone family held
 // only 34–44% of the time at 1.5R (a level with no edge ≈ 40%), on 15m, 1H and
@@ -1376,9 +1382,18 @@ phase6StTrend = phase6StDirection < 0 ? 1 : -1
 
 phase6UseFastPullback = input.bool(true, 'Require fast pullback', group='Engine 6 — Trigger', tooltip='Trade only when the break comes within the set number of 5m bars after the broken internal swing pivot: a quick pullback that resumes the trend. Backtest 2024-01..2026-10: breaks 12+ bars after the pivot won 42.5%.')
 phase6MaxPullbackBars = input.int(11, 'Max bars from broken pivot to break', minval=6, maxval=200, group='Engine 6 — Trigger')
-phase6UseCalm1H = input.bool(true, 'Require calm 1H (Choppiness Index)', group='Engine 6 — Trigger', tooltip='Choppiness Index (E.W. Dreiss) of the last completed 1H bar must be below the maximum. High values mean a sideways, two-way market where trend breaks fail more often (43.7% win rate when >= 49). OFF: more trades (about 0.44/day), 57.7% win rate.')
+phase6UseCalm1H = input.bool(false, 'Require calm 1H (Choppiness Index)', group='Engine 6 — Trigger', tooltip='Choppiness Index (E.W. Dreiss) of the last completed 1H bar must be below the maximum. OFF by default since V7.6: on the latest 6 months it removed winning trades (24 vs 40 trades at a similar win rate). On 2024-2025 data it helped (58.5% vs 54.1%).')
 phase6ChopLength = input.int(14, '1H Choppiness length', minval=2, group='Engine 6 — Trigger')
 phase6ChopMax = input.float(50.0, '1H Choppiness maximum', minval=0.0, maxval=100.0, step=1.0, group='Engine 6 — Trigger')
+phase6UseTK = input.bool(true, 'Require Ichimoku Tenkan/Kijun agreement', group='Engine 6 — Trigger', tooltip='Ichimoku (Goichi Hosoda): Tenkan-sen = midpoint of the last 9 bars, Kijun-sen = midpoint of the last 26 bars, on the 5m chart. Longs only when Tenkan is above Kijun, shorts only when below: short-term momentum agrees with the trade.')
+phase6UseRsiCap = input.bool(true, 'Skip overextended entries (RSI 14)', group='Engine 6 — Trigger', tooltip='No long when RSI(14) is at or above the overbought level, no short when at or below the oversold level: avoids buying the top / selling the bottom of an extended move.')
+phase6RsiHigh = input.float(70.0, 'RSI overbought (no longs at/above)', minval=50.0, maxval=100.0, step=1.0, group='Engine 6 — Trigger')
+phase6RsiLow = input.float(30.0, 'RSI oversold (no shorts at/below)', minval=0.0, maxval=50.0, step=1.0, group='Engine 6 — Trigger')
+phase6Tenkan = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2
+phase6Kijun = (ta.highest(high, 26) + ta.lowest(low, 26)) / 2
+phase6Rsi = ta.rsi(close, 14)
+phase6LongMomentumOk = (not phase6UseTK or phase6Tenkan > phase6Kijun) and (not phase6UseRsiCap or phase6Rsi < phase6RsiHigh)
+phase6ShortMomentumOk = (not phase6UseTK or phase6Tenkan < phase6Kijun) and (not phase6UseRsiCap or phase6Rsi > phase6RsiLow)
 
 // Last completed 1H bar only ([1] with lookahead on): no repainting.
 phase6_chop_packet(_length) =>
@@ -1392,19 +1407,22 @@ phase6ShortPivotAge = na(phase6InternalBottomBar) ? na : bar_index - phase6Inter
 phase6LongFast = not phase6UseFastPullback or (not na(phase6LongPivotAge) and phase6LongPivotAge <= phase6MaxPullbackBars)
 phase6ShortFast = not phase6UseFastPullback or (not na(phase6ShortPivotAge) and phase6ShortPivotAge <= phase6MaxPullbackBars)
 
-phase6LongTrigger = phase6CanAdvance and exec5mInternalBullBreak and macro4HBias == 1 and bias1H == 1 and (not phase6UseSupertrend or phase6StTrend == 1) and phase6LongFast and phase6RegimeOk
-phase6ShortTrigger = phase6CanAdvance and exec5mInternalBearBreak and macro4HBias == -1 and bias1H == -1 and (not phase6UseSupertrend or phase6StTrend == -1) and phase6ShortFast and phase6RegimeOk
+phase6LongTrigger = phase6CanAdvance and exec5mInternalBullBreak and macro4HBias == 1 and bias1H == 1 and (not phase6UseSupertrend or phase6StTrend == 1) and phase6LongFast and phase6RegimeOk and phase6LongMomentumOk
+phase6ShortTrigger = phase6CanAdvance and exec5mInternalBearBreak and macro4HBias == -1 and bias1H == -1 and (not phase6UseSupertrend or phase6StTrend == -1) and phase6ShortFast and phase6RegimeOk and phase6ShortMomentumOk
 phase6Side = phase6LongTrigger ? 1 : phase6ShortTrigger ? -1 : 0
 phase6DirectionContext = macro4HBias == 1 and bias1H == 1 ? 1 : macro4HBias == -1 and bias1H == -1 ? -1 : 0
 phase6DirectionText = phase6DirectionContext == 1 ? 'BULLISH (longs only)' : phase6DirectionContext == -1 ? 'BEARISH (shorts only)' : 'MIXED (no trades)'
 
-// Protected extreme: lowest low (long) / highest high (short) from the broken
-// internal swing pivot to the trigger bar; last 13 bars if the pivot is too old.
+// Protected extreme: lowest low (long) / highest high (short) of the pullback,
+// from the bar after the broken internal swing pivot to the trigger bar (the
+// pivot candle itself is the top/bottom of the previous leg, not the pullback);
+// last 13 bars if the pivot is too old.
+phase6ProtectAfterPivot = input.bool(true, 'Protected extreme starts after the broken pivot', group='Engine 7 — Construction', tooltip='ON (V7.6): the stop sits beyond the pullback low/high only. OFF (V7.5): the broken pivot candle is included, which can widen the stop.')
 float phase6ProtectedExtreme = na
 float phase6BrokenLevel = na
 if phase6Side != 0
     int _pivotBar = phase6Side == 1 ? phase6InternalTopBar : phase6InternalBottomBar
-    int _span = not na(_pivotBar) and bar_index - _pivotBar <= 200 ? bar_index - _pivotBar + 1 : 13
+    int _span = not na(_pivotBar) and bar_index - _pivotBar <= 200 ? bar_index - _pivotBar + (phase6ProtectAfterPivot ? 0 : 1) : 13
     for _offset = 0 to _span - 1
         if phase6Side == 1
             phase6ProtectedExtreme := na(phase6ProtectedExtreme) ? low[_offset] : math.min(phase6ProtectedExtreme, low[_offset])
@@ -1423,7 +1441,8 @@ phase6ReadyForRisk = phase6StateCode == 3
 //   skipped if that stop is wider than $15 or tighter than $2.
 // TP1: 1.51R (rule: TP1 > 1.5R), only if no obstacle lies between entry and
 //   TP1 (clean room). Obstacles: 15m Pivot S/R zones, unswept 15m EQH/EQL and
-//   the 4H swing high/low. 15m Supply/Demand zones and Order Blocks are NOT
+//   the 4H swing level (resting liquidity, or flipped S/R once traded through).
+//   15m Supply/Demand zones and Order Blocks are NOT
 //   obstacles: measured over 2.75 years they did not hold, and treating them
 //   as obstacles only removed good trades.
 // TP2: 2.5R, or just in front of the first obstacle beyond TP1 if that comes
@@ -1435,7 +1454,7 @@ phase7MinStopUSD = input.float(2.0, 'Minimum stop distance ($)', minval=0.0, ste
 phase7TP1Multiple = input.float(1.51, 'TP1 (R multiple, must be > 1.5)', minval=1.51, maxval=5.0, step=0.01, group='Engine 7 — Construction')
 phase7TP2Multiple = input.float(2.5, 'TP2 maximum (R multiple)', minval=1.75, maxval=9.5, step=0.25, group='Engine 7 — Construction')
 phase7TargetFrontATR = input.float(0.1, 'TP2 front-run before an opposing zone (ATR)', minval=0.0, step=0.05, group='Engine 7 — Construction')
-phase7RequireCleanRoom = input.bool(true, 'Require clean room to TP1 (no obstacle)', group='Engine 7 — Construction', tooltip='Obstacles: 15m Pivot S/R, unswept 15m EQH/EQL, 4H swing high/low.')
+phase7RequireCleanRoom = input.bool(true, 'Require clean room to TP1 (no obstacle)', group='Engine 7 — Construction', tooltip='Obstacles: 15m Pivot S/R zones, unswept 15m EQH/EQL, and the 4H swing level (resting liquidity, or flipped support/resistance once traded through).')
 
 phase7_reason_code(_reason) =>
     _reason == 'VALID_TRADE' ? 1 :
@@ -1457,7 +1476,10 @@ phase7_level_unswept(_price, _side) =>
     not na(_price) and not na(_snapshotClose) and not _swept
 
 // Nearest obstacle strictly beyond _from in the trade direction: the near edge
-// of a 15m Pivot S/R zone, an unswept 15m EQH/EQL, or the 4H swing high/low.
+// of a 15m Pivot S/R zone, an unswept 15m EQH/EQL, or the 4H swing level. The
+// 4H level stays an obstacle after it has been traded through earlier (it then
+// acts as flipped support/resistance, a failed-breakout level): treating such
+// levels as clear only added losing trades in the 6-month test.
 phase7_nearest_opposing(_side, _from) =>
     float _best = na
     array<float> _zoneEdges = _side == 1 ?
@@ -1573,7 +1595,7 @@ plot(phase7BridgeValid ? phase7ImpulseStrength : phase7BridgeStrengthSentinel, '
 // DECISION LEVELS ON THE CHART
 // Draws exactly what the trade logic uses, so chart reading matches the logic:
 // the 5m Supertrend, and the current clean-room obstacles (15m Pivot S/R zones,
-// unswept 15m EQH/EQL, 4H swing high/low). Only levels within reach of a trade
+// unswept 15m EQH/EQL, 4H swing level). Only levels within reach of a trade
 // are drawn: TP2 is at most 2.5R with R at most $15, so a level farther than
 // that from price can never block TP1 or cap TP2. Plotted after the ten bridge
 // plots, so the Execution input mapping (plots 0-9) is unchanged.
@@ -1649,7 +1671,7 @@ phase5_debug_row(_row, _name, _value, _background) =>
 
 if barstate.islast
     if phase5DebugOn
-        table.cell(phase5DebugTable, 0, 0, 'V7.5 SIGNAL ENGINE', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.tiny)
+        table.cell(phase5DebugTable, 0, 0, 'V7.6 SIGNAL ENGINE', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.tiny)
         table.cell(phase5DebugTable, 1, 0, phase5ExecutionTfOk and phase5TfHierarchyOk ? '5m chart OK' : 'Use locked 5m chart', text_color=color.white, bgcolor=phase5ExecutionTfOk and phase5TfHierarchyOk ? color.new(color.green, 55) : color.new(color.orange, 35), text_size=size.tiny)
         phase5_debug_row(1, '4H macro bias', phase5_bias_text(macro4HBias), phase5_state_color(macro4HBias))
         phase5_debug_row(2, '4H high / low', phase5_price_text(macro4HHigh) + ' / ' + phase5_price_text(macro4HLow), color.new(color.gray, 75))
@@ -1673,11 +1695,12 @@ if barstate.islast
         phase5_debug_row(20, '5m swing CHoCH B/S', str.tostring(exec5mSwingBullCHoCH) + ' / ' + str.tostring(exec5mSwingBearCHoCH), color.new(color.gray, 75))
         phase5_debug_row(21, '5m internal break B/S', str.tostring(exec5mInternalBullBreak) + ' / ' + str.tostring(exec5mInternalBearBreak), color.new(color.gray, 75))
         phase5_debug_row(22, '5m Supertrend (' + str.tostring(phase6StPeriod) + ', ' + str.tostring(phase6StFactor, '#.#') + ')', (phase6StTrend == 1 ? 'UP ' : 'DOWN ') + phase5_price_text(phase6StLine) + (phase6UseSupertrend ? '' : ' (filter OFF)'), phase5_state_color(phase6StTrend))
-        phase5_debug_row(23, 'Trade side allowed now', phase6DirectionContext == 0 ? 'none (4H/1H mixed)' : phase6UseSupertrend and phase6StTrend != phase6DirectionContext ? 'none (Supertrend against)' : not phase6RegimeOk ? 'none (1H choppy)' : (phase6DirectionContext == 1 ? 'LONG' : 'SHORT') + (phase6UseFastPullback ? ' (fast break only)' : ''), phase5_state_color(phase6DirectionContext == 0 or (phase6UseSupertrend and phase6StTrend != phase6DirectionContext) or not phase6RegimeOk ? 0 : phase6DirectionContext))
+        _momentumOk = phase6DirectionContext == 1 ? phase6LongMomentumOk : phase6ShortMomentumOk
+        phase5_debug_row(23, 'Trade side allowed now', phase6DirectionContext == 0 ? 'none (4H/1H mixed)' : phase6UseSupertrend and phase6StTrend != phase6DirectionContext ? 'none (Supertrend against)' : not phase6RegimeOk ? 'none (1H choppy)' : not _momentumOk ? 'none (Ichimoku/RSI against)' : (phase6DirectionContext == 1 ? 'LONG' : 'SHORT') + (phase6UseFastPullback ? ' (fast break only)' : ''), phase5_state_color(phase6DirectionContext == 0 or (phase6UseSupertrend and phase6StTrend != phase6DirectionContext) or not phase6RegimeOk or not _momentumOk ? 0 : phase6DirectionContext))
         phase5_debug_row(24, 'Bars since pivot L / S (max ' + str.tostring(phase6MaxPullbackBars) + ')', (na(phase6LongPivotAge) ? '—' : str.tostring(phase6LongPivotAge)) + ' / ' + (na(phase6ShortPivotAge) ? '—' : str.tostring(phase6ShortPivotAge)) + (phase6UseFastPullback ? '' : ' (rule OFF)'), color.new(color.gray, 75))
         phase5_debug_row(25, '1H Choppiness (max ' + str.tostring(phase6ChopMax, '#') + ')', (na(phase6Chop1H) ? '—' : str.tostring(phase6Chop1H, '#.0')) + (phase6RegimeOk ? ' calm' : ' choppy') + (phase6UseCalm1H ? '' : ' (rule OFF)'), phase6RegimeOk ? color.new(color.green, 70) : color.new(color.orange, 55))
         phase5_debug_row(26, '5m ATR(89)', phase5_price_text(exec5mATR), color.new(color.gray, 75))
-        phase5_debug_row(27, '', '', color.new(color.gray, 100))
+        phase5_debug_row(27, 'Ichimoku TK / RSI(14)', (phase6Tenkan > phase6Kijun ? 'TK up' : phase6Tenkan < phase6Kijun ? 'TK down' : 'TK flat') + (phase6UseTK ? '' : ' (OFF)') + ' | RSI ' + str.tostring(phase6Rsi, '#.0') + (phase6UseRsiCap ? '' : ' (OFF)'), phase5_state_color(phase6Tenkan > phase6Kijun ? 1 : phase6Tenkan < phase6Kijun ? -1 : 0))
         phase5_debug_row(28, 'E6 direction (4H + 1H)', phase6DirectionText, phase5_state_color(phase6DirectionContext))
         phase5_debug_row(29, 'E6 last trigger', na(phase7LastProcessedReadyTime) ? '—' : (phase7Side == 1 ? 'LONG ' : 'SHORT ') + str.format_time(phase7LastProcessedReadyTime, 'MM-dd HH:mm'), color.new(color.gray, 75))
         phase5_debug_row(30, 'E7 last result', phase7Reason, phase7BridgeValid ? color.new(color.green, 45) : color.new(color.orange, 55))
@@ -1694,7 +1717,7 @@ if barstate.islast
         table.clear(phase5DebugTable, 0, 0, 1, 39)
 
 // =============================================================================
-// V7.5 STRATEGY TEST — ORDERS AND RESULTS (appended; the logic above is unchanged)
+// STRATEGY TESTER — ORDERS AND RESULTS (appended; the logic above is the Signal Engine)
 // =============================================================================
 stRiskUSD = input.float(100.0, 'Risk per trade ($)', minval=1.0, step=10.0, group='Strategy test', tooltip='Position size = risk / stop distance, so net profit / risk = net R.')
 stTP1ClosePct = input.int(50, 'Close at TP1 (%)', minval=1, maxval=100, group='Strategy test', tooltip='50 = the V7.5 system (runner to TP2 with the original stop). 100 = close everything at TP1; TradingView\'s "Percent profitable" then equals the project win rate.')
@@ -1764,7 +1787,7 @@ if stNewPackage and stState == 0 and strategy.position_size == 0
     stState := 1
     stTrades += 1
     float stQty = stRiskUSD / (math.abs(stEntry - stSL) * syminfo.pointvalue)
-    string stId = stSide == 1 ? 'V7.5 LONG' : 'V7.5 SHORT'
+    string stId = stSide == 1 ? 'LONG' : 'SHORT'
     strategy.entry(stId, stSide == 1 ? strategy.long : strategy.short, qty=stQty)
     if stTP1ClosePct < 100
         strategy.exit('TP1', from_entry=stId, qty_percent=stTP1ClosePct, limit=stTP1, stop=stSL, comment_profit='TP1 WIN', comment_loss='SL before TP1')
@@ -1783,7 +1806,7 @@ st_row(_row, _name, _value, _bg) =>
 // A strategy only calculates on confirmed bars: draw on the last confirmed history bar too.
 if (barstate.islast or barstate.islastconfirmedhistory) and stShowTable
     _closed = stWins + stLosses
-    table.cell(stTable, 0, 0, 'V7.5 STRATEGY TESTER', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.small)
+    table.cell(stTable, 0, 0, 'STRATEGY TESTER (V7.6)', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.small)
     table.cell(stTable, 1, 0, stTfOk ? 'your rules: TP1/TP2 = WIN, SL first = LOSS' : 'Switch chart to 5m', text_color=color.white, bgcolor=stTfOk ? color.new(color.green, 55) : color.new(color.red, 35), text_size=size.small)
     st_row(1, 'History tested', str.format_time(stFirstTime, 'yyyy-MM-dd') + ' → ' + str.format_time(time, 'yyyy-MM-dd') + ' (' + str.tostring(stDays) + ' days)', color.new(color.gray, 75))
     st_row(2, 'Trades (per day)', str.tostring(stTrades) + ' (' + (stDays > 0 ? str.tostring(float(stTrades) / stDays, '#.##') : '—') + ')' + (stState == 1 ? ' | 1 open' : ''), color.new(color.gray, 75))
