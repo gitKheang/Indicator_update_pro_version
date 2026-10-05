@@ -1,0 +1,1799 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// XAUUSD Smart Trade — V7.5 STRATEGY TEST (self-contained).
+// The decision logic below is the deployed V7.5 Brain, unchanged; only the declaration
+// is strategy() and the order/results block is appended at the end. It needs no
+// indicator-on-indicator link (the Essential plan allows one per layout, used by the
+// Execution -> Brain bridge).
+//   entry : market, at the trigger candle close (process_orders_on_close)
+//   exits : TP1 share at TP1, the rest at TP2; every part keeps the ORIGINAL stop
+//           (no break-even)
+//   size  : fixed dollar risk per trade (risk / stop distance), so profit / risk = R
+//   costs : $0.15 per ounce per fill ($0.30 round trip), as in the Python backtest
+// Win/loss by the project rule: TP1 (or TP2) reached = WIN, stop before TP1 = LOSS. The
+// results table counts trades that way (stop first when one candle touches both).
+// TradingView's own "Percent profitable" counts the TP1 part and the runner part of a
+// trade as two separate trades; set "Close at TP1" to 100% to make them the same.
+//
+//@version=5
+strategy(title="XAUUSD Smart Trade — V7.5 Strategy Test", shorttitle="V7.5 Strategy Test", overlay=true, max_bars_back=500,
+  initial_capital=10000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=1,
+  pyramiding=0, process_orders_on_close=true, commission_type=strategy.commission.cash_per_contract,
+  commission_value=0.15, margin_long=1, margin_short=1)
+
+// =============================================================================
+// LEAN CORE — REQUIRED INPUT CONTRACT
+// Defaults intentionally match the full v4 master. Do not tune during parity.
+// =============================================================================
+
+length = input.int(50, "Swing Length", minval=10, group="Lean Core — Structure")
+ifilter_confluence = input.bool(false, "Internal Confluence Filter", group="Lean Core — Structure")
+ob_filter = input.string("Atr", "Order Block Filter", options=["Atr", "Cumulative Mean Range"], group="Lean Core — 15m AOI")
+
+eq_len = input.int(3, "EQH/EQL Bars Confirmation", minval=1, group="Lean Core — 15m AOI")
+eq_threshold = input.float(0.1, "EQH/EQL Threshold", minval=0, maxval=0.5, step=0.1, group="Lean Core — 15m AOI")
+fvg_auto = input.bool(true, "FVG Auto Threshold", group="Lean Core — 15m AOI")
+
+ds_min_pc_change = input.float(0.2, "D/S Min % change", minval=0, step=0.05, group="Lean Core — 15m AOI", tooltip="Minimum 15m displacement that creates a Demand/Supply zone. 0.2% is about 1x 15m ATR on XAUUSD near 4,000; 0.05% (about $2) created noise zones that blocked targets.")
+ds_max_pc_zone = input.float(0.5, "D/S Max % zone height", minval=0, step=0.05, group="Lean Core — 15m AOI", tooltip="Upper limit for a Demand/Supply zone height. 0.5% lets the zone cover the full base candle range as a trader draws it; the former 0.05% (about $2 on gold) cut zones to a third of the base and those thin zones held worse than a random level.")
+
+left = input.int(20, "Pivot Look Left", group="Lean Core — Pivot S/R")
+right = input.int(15, "Pivot Look Right", group="Lean Core — Pivot S/R")
+nPiv = input.int(1, "Number of Pivots", group="Lean Core — Pivot S/R")
+atrLen = input.int(30, "Pivot ATR Length", group="Lean Core — Pivot S/R")
+mult = input.float(0.5, "Pivot Zone Width (ATR)", step=0.1, group="Lean Core — Pivot S/R")
+per = input.float(5.0, "Pivot Max Zone Percent", group="Lean Core — Pivot S/R")
+src = input.string("HA", "Pivot Source", options=["HA", "High/Low Body", "High/Low"], group="Lean Core — Pivot S/R")
+alignZones = input.bool(true, "Align Pivot Zones", group="Lean Core — Pivot S/R")
+dhighs = input.bool(true, "Detect Pivot Highs", group="Lean Core — Pivot S/R")
+dlows = input.bool(true, "Detect Pivot Lows", group="Lean Core — Pivot S/R")
+
+// =============================================================================
+// LEAN CORE — SHARED HELPERS
+// =============================================================================
+
+swings(len) =>
+    var os = 0
+    upper = ta.highest(len)
+    lower = ta.lowest(len)
+    os := high[len] > upper ? 0 : low[len] < lower ? 1 : os[1]
+    top = os == 0 and os[1] != 0 ? high[len] : 0
+    btm = os == 1 and os[1] != 1 ? low[len] : 0
+    [top, btm]
+
+get_pc_diff_abs(x_start, y_end) =>
+    math.abs((y_end - x_start) / x_start * 100)
+
+get_amount_by_pc(amount, pc, add_minus) =>
+    pc_amount = amount * (pc / 100)
+    add_minus == "add" ? amount + pc_amount : amount - pc_amount
+
+_haBody() =>
+    haClose = (open + high + low + close) / 4
+    haOpen = float(na)
+    haOpen := na(haOpen[1]) ? (open + close) / 2 : (nz(haOpen[1]) + nz(haClose[1])) / 2
+    [haOpen, haClose]
+
+// =============================================================================
+// LEAN CORE — 5m STRUCTURE STATE
+// Same swing sources, close-cross rules, break locks, and confluence formula as
+// the full v4 master. Presentation and OB drawing side effects are omitted.
+// =============================================================================
+
+[top, btm] = swings(length)
+[itop, ibtm] = swings(5)
+
+var float top_y = 0.0
+var float btm_y = 0.0
+var float itop_y = 0.0
+var float ibtm_y = 0.0
+var bool top_cross = true
+var bool btm_cross = true
+var bool itop_cross = true
+var bool ibtm_cross = true
+var int trend = 0
+var int itrend = 0
+
+bull_ichoch_alert = false
+bear_ichoch_alert = false
+// Any internal break in that direction (CHoCH or continuation BOS). Engine 6
+// uses it as post-touch confirmation; the CHoCH pulses above are unchanged.
+bull_ibreak_alert = false
+bear_ibreak_alert = false
+bull_choch_alert = false
+bear_choch_alert = false
+
+if top
+    top_cross := true
+    top_y := top
+if btm
+    btm_cross := true
+    btm_y := btm
+if itop
+    itop_cross := true
+    itop_y := itop
+if ibtm
+    ibtm_cross := true
+    ibtm_y := ibtm
+
+bull_concordant = true
+if ifilter_confluence
+    bull_concordant := high - math.max(close, open) > math.min(close, open) - low
+
+if ta.crossover(close, itop_y) and itop_cross and top_y != itop_y and bull_concordant
+    if itrend < 0
+        bull_ichoch_alert := true
+    bull_ibreak_alert := true
+    itop_cross := false
+    itrend := 1
+
+if ta.crossover(close, top_y) and top_cross
+    if trend < 0
+        bull_choch_alert := true
+    top_cross := false
+    trend := 1
+
+bear_concordant = true
+if ifilter_confluence
+    bear_concordant := high - math.max(close, open) < math.min(close, open) - low
+
+if ta.crossunder(close, ibtm_y) and ibtm_cross and btm_y != ibtm_y and bear_concordant
+    if itrend > 0
+        bear_ichoch_alert := true
+    bear_ibreak_alert := true
+    ibtm_cross := false
+    itrend := -1
+
+if ta.crossunder(close, btm_y) and btm_cross
+    if trend > 0
+        bear_choch_alert := true
+    btm_cross := false
+    trend := -1
+
+// =============================================================================
+// LEAN CORE — ATR(89): the volatility unit for stops, buffers and impulses.
+// (V7.4 removed the nine-indicator dashboard and BULB from the Brain: no
+// decision used them, and the Visual Reference script already shows that panel.)
+// =============================================================================
+
+atrv = ta.atr(89)
+
+// =============================================================================
+// PHASE 5 — MULTI-TIMEFRAME STATE ARCHITECTURE
+// Collects and normalizes confirmed information only. It does not score setups,
+// create trade signals, lock AOIs, calculate stops/targets, or place trades.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// PHASE 5 / PIECE 1 OF 8 — MTF Timeframe Controller
+// -----------------------------------------------------------------------------
+phase5MacroTf = input.timeframe('240', 'Macro TF', options=['240'], group='Phase 5 — MTF Controller')
+phase5BiasTf = input.timeframe('60', 'Bias TF', options=['60'], group='Phase 5 — MTF Controller')
+phase5SetupTf = input.timeframe('15', 'Setup TF', options=['15'], group='Phase 5 — MTF Controller')
+phase5ExecutionTf = input.timeframe('5', 'Execution TF', options=['5'], group='Phase 5 — MTF Controller')
+phase5SetupHistoryBars = input.int(500, '15m setup history bars', minval=500, maxval=5000, group='Phase 5 — MTF Controller', tooltip='Limits the 15m Phase 5 request history to protect TradingView memory. Increase cautiously only after confirming runtime stability.')
+phase5ActiveCandidateCap = input.int(100, 'Active candidate safety cap', minval=25, maxval=500, group='Phase 5 — MTF Controller', tooltip='Maximum active 15m candidates retained per AOI type before the oldest active candidate is removed for runtime safety. Phase 5 still publishes the nearest three from the retained pool.')
+phase5ExecutionTfOk = timeframe.period == phase5ExecutionTf
+phase5TfHierarchyOk = timeframe.in_seconds(phase5MacroTf) > timeframe.in_seconds(phase5BiasTf) and
+  timeframe.in_seconds(phase5BiasTf) > timeframe.in_seconds(phase5SetupTf) and
+  timeframe.in_seconds(phase5SetupTf) > timeframe.in_seconds(phase5ExecutionTf)
+
+// -----------------------------------------------------------------------------
+// PHASE 5 / PIECE 2 OF 8 — Safe / Confirmed MTF Data Layer
+// The one-bar offset plus lookahead_on returns only the last closed source-TF bar.
+// State packet functions below apply the same offset before transport.
+// -----------------------------------------------------------------------------
+phase5_confirmed_ohlc(_tf) =>
+    request.security(syminfo.tickerid, _tf, [open[1], high[1], low[1], close[1], time[1]], lookahead=barmerge.lookahead_on)
+
+phase5_confirmed_previous_hl(_tf) =>
+    request.security(syminfo.tickerid, _tf, [high[1], low[1]], lookahead=barmerge.lookahead_on)
+
+// Uses the last confirmed swing boundaries by design. This is stable Master-Brain
+// context and is separate from the original chart boxes' live trail_up/trail_dn range.
+phase5_range_location(_price, _rangeHigh, _rangeLow) =>
+    int _location = 9
+    if not na(_rangeHigh) and not na(_rangeLow) and _rangeHigh > _rangeLow
+        _premiumFloor = 0.95 * _rangeHigh + 0.05 * _rangeLow
+        _equilibriumHigh = 0.525 * _rangeHigh + 0.475 * _rangeLow
+        _equilibriumLow = 0.525 * _rangeLow + 0.475 * _rangeHigh
+        _discountCeiling = 0.95 * _rangeLow + 0.05 * _rangeHigh
+        _location := _price >= _premiumFloor ? 1 :
+          _price <= _discountCeiling ? -1 :
+          _price <= _equilibriumHigh and _price >= _equilibriumLow ? 0 :
+          _price > _equilibriumHigh ? 2 : -2
+    _location
+
+phase5_align_zone_arrays(_sourceTop, _sourceBottom, _sourceOrigin, _sourceConfirmed, _sourceFresh, _targetTop, _targetBottom, _targetOrigin, _targetConfirmed, _targetFresh) =>
+    if array.size(_targetTop) > 0
+        for _zoneIndex = 0 to (array.size(_sourceTop) == 0 ? na : array.size(_sourceTop) - 1)
+            _targetZoneTop = array.get(_targetTop, 0)
+            _targetZoneBottom = array.get(_targetBottom, 0)
+            _sourceZoneTop = array.get(_sourceTop, _zoneIndex)
+            _sourceZoneBottom = array.get(_sourceBottom, _zoneIndex)
+            _overlaps = (_targetZoneTop > _sourceZoneBottom and _targetZoneTop < _sourceZoneTop) or
+              (_targetZoneBottom < _sourceZoneTop and _targetZoneBottom > _sourceZoneBottom) or
+              (_targetZoneTop > _sourceZoneTop and _targetZoneBottom < _sourceZoneBottom) or
+              (_targetZoneBottom > _sourceZoneBottom and _targetZoneTop < _sourceZoneTop)
+            if _overlaps
+                array.set(_targetTop, 0, _sourceZoneTop)
+                array.set(_targetBottom, 0, _sourceZoneBottom)
+                array.set(_targetOrigin, 0, math.min(array.get(_targetOrigin, 0), array.get(_sourceOrigin, _zoneIndex)))
+                array.set(_targetConfirmed, 0, math.max(array.get(_targetConfirmed, 0), array.get(_sourceConfirmed, _zoneIndex)))
+                array.set(_targetFresh, 0, array.get(_targetFresh, 0) and array.get(_sourceFresh, _zoneIndex))
+
+phase5_three_candidates(_tops, _bottoms, _originTimes, _confirmedTimes, _freshStates, _distanceMode) =>
+    float _top1 = na
+    float _bottom1 = na
+    int _origin1 = na
+    int _confirmed1 = na
+    bool _fresh1 = false
+    float _distance1 = na
+    float _top2 = na
+    float _bottom2 = na
+    int _origin2 = na
+    int _confirmed2 = na
+    bool _fresh2 = false
+    float _distance2 = na
+    float _top3 = na
+    float _bottom3 = na
+    int _origin3 = na
+    int _confirmed3 = na
+    bool _fresh3 = false
+    float _distance3 = na
+    for _candidateIndex = 0 to (array.size(_tops) == 0 ? na : array.size(_tops) - 1)
+        _candidateTop = array.get(_tops, _candidateIndex)
+        _candidateBottom = array.get(_bottoms, _candidateIndex)
+        _candidateOrigin = array.get(_originTimes, _candidateIndex)
+        _candidateConfirmed = array.get(_confirmedTimes, _candidateIndex)
+        _candidateFresh = array.get(_freshStates, _candidateIndex)
+        _candidatePrice = _distanceMode == 1 ? _candidateTop : _distanceMode == -1 ? _candidateBottom : math.avg(_candidateTop, _candidateBottom)
+        _candidateDistance = math.abs(close - _candidatePrice)
+        if na(_distance1) or _candidateDistance < _distance1
+            _top3 := _top2
+            _bottom3 := _bottom2
+            _origin3 := _origin2
+            _confirmed3 := _confirmed2
+            _fresh3 := _fresh2
+            _distance3 := _distance2
+            _top2 := _top1
+            _bottom2 := _bottom1
+            _origin2 := _origin1
+            _confirmed2 := _confirmed1
+            _fresh2 := _fresh1
+            _distance2 := _distance1
+            _top1 := _candidateTop
+            _bottom1 := _candidateBottom
+            _origin1 := _candidateOrigin
+            _confirmed1 := _candidateConfirmed
+            _fresh1 := _candidateFresh
+            _distance1 := _candidateDistance
+        else if na(_distance2) or _candidateDistance < _distance2
+            _top3 := _top2
+            _bottom3 := _bottom2
+            _origin3 := _origin2
+            _confirmed3 := _confirmed2
+            _fresh3 := _fresh2
+            _distance3 := _distance2
+            _top2 := _candidateTop
+            _bottom2 := _candidateBottom
+            _origin2 := _candidateOrigin
+            _confirmed2 := _candidateConfirmed
+            _fresh2 := _candidateFresh
+            _distance2 := _candidateDistance
+        else if na(_distance3) or _candidateDistance < _distance3
+            _top3 := _candidateTop
+            _bottom3 := _candidateBottom
+            _origin3 := _candidateOrigin
+            _confirmed3 := _candidateConfirmed
+            _fresh3 := _candidateFresh
+            _distance3 := _candidateDistance
+    [_top1, _bottom1, _origin1, _confirmed1, _fresh1,
+      _top2, _bottom2, _origin2, _confirmed2, _fresh2,
+      _top3, _bottom3, _origin3, _confirmed3, _fresh3]
+
+phase5_three_liquidity_levels(_levels, _originTimes, _confirmedTimes, _abovePrice) =>
+    float _level1 = na
+    int _origin1 = na
+    int _confirmed1 = na
+    float _distance1 = na
+    float _level2 = na
+    int _origin2 = na
+    int _confirmed2 = na
+    float _distance2 = na
+    float _level3 = na
+    int _origin3 = na
+    int _confirmed3 = na
+    float _distance3 = na
+    for _candidateIndex = 0 to (array.size(_levels) == 0 ? na : array.size(_levels) - 1)
+        _candidateLevel = array.get(_levels, _candidateIndex)
+        _eligible = _abovePrice ? _candidateLevel > close : _candidateLevel < close
+        if _eligible
+            _candidateOrigin = array.get(_originTimes, _candidateIndex)
+            _candidateConfirmed = array.get(_confirmedTimes, _candidateIndex)
+            _candidateDistance = math.abs(close - _candidateLevel)
+            if na(_distance1) or _candidateDistance < _distance1
+                _level3 := _level2
+                _origin3 := _origin2
+                _confirmed3 := _confirmed2
+                _distance3 := _distance2
+                _level2 := _level1
+                _origin2 := _origin1
+                _confirmed2 := _confirmed1
+                _distance2 := _distance1
+                _level1 := _candidateLevel
+                _origin1 := _candidateOrigin
+                _confirmed1 := _candidateConfirmed
+                _distance1 := _candidateDistance
+            else if na(_distance2) or _candidateDistance < _distance2
+                _level3 := _level2
+                _origin3 := _origin2
+                _confirmed3 := _confirmed2
+                _distance3 := _distance2
+                _level2 := _candidateLevel
+                _origin2 := _candidateOrigin
+                _confirmed2 := _candidateConfirmed
+                _distance2 := _candidateDistance
+            else if na(_distance3) or _candidateDistance < _distance3
+                _level3 := _candidateLevel
+                _origin3 := _candidateOrigin
+                _confirmed3 := _candidateConfirmed
+                _distance3 := _candidateDistance
+    [_level1, _origin1, _confirmed1, _level2, _origin2, _confirmed2, _level3, _origin3, _confirmed3]
+
+type Phase5ZoneCandidate
+    float top
+    float bottom
+    int origin
+    int confirmed
+    bool fresh
+
+type Phase5LiquidityCandidate
+    float level
+    int origin
+    int confirmed
+
+type Phase5SetupState
+    Phase5ZoneCandidate demand1
+    Phase5ZoneCandidate demand2
+    Phase5ZoneCandidate demand3
+    Phase5ZoneCandidate supply1
+    Phase5ZoneCandidate supply2
+    Phase5ZoneCandidate supply3
+    Phase5ZoneCandidate bullOb1
+    Phase5ZoneCandidate bullOb2
+    Phase5ZoneCandidate bullOb3
+    Phase5ZoneCandidate bearOb1
+    Phase5ZoneCandidate bearOb2
+    Phase5ZoneCandidate bearOb3
+    Phase5ZoneCandidate bullFvg1
+    Phase5ZoneCandidate bullFvg2
+    Phase5ZoneCandidate bullFvg3
+    Phase5ZoneCandidate bearFvg1
+    Phase5ZoneCandidate bearFvg2
+    Phase5ZoneCandidate bearFvg3
+    Phase5ZoneCandidate pivotSupport1
+    Phase5ZoneCandidate pivotSupport2
+    Phase5ZoneCandidate pivotSupport3
+    Phase5ZoneCandidate pivotResistance1
+    Phase5ZoneCandidate pivotResistance2
+    Phase5ZoneCandidate pivotResistance3
+    Phase5LiquidityCandidate eqh1
+    Phase5LiquidityCandidate eqh2
+    Phase5LiquidityCandidate eqh3
+    Phase5LiquidityCandidate eql1
+    Phase5LiquidityCandidate eql2
+    Phase5LiquidityCandidate eql3
+    int location
+    float rangeHigh
+    float rangeLow
+
+// request.security() can return an undefined UDT on the chart's earliest bars
+// before the source-timeframe packet has a completed value. Keep the public
+// interface safe during that initialization window without inventing state.
+phase5_empty_setup_state() =>
+    _emptyZone = Phase5ZoneCandidate.new(na, na, na, na, false)
+    _emptyLiquidity = Phase5LiquidityCandidate.new(na, na, na)
+    Phase5SetupState.new(
+      _emptyZone, _emptyZone, _emptyZone,
+      _emptyZone, _emptyZone, _emptyZone,
+      _emptyZone, _emptyZone, _emptyZone,
+      _emptyZone, _emptyZone, _emptyZone,
+      _emptyZone, _emptyZone, _emptyZone,
+      _emptyZone, _emptyZone, _emptyZone,
+      _emptyZone, _emptyZone, _emptyZone,
+      _emptyZone, _emptyZone, _emptyZone,
+      _emptyLiquidity, _emptyLiquidity, _emptyLiquidity,
+      _emptyLiquidity, _emptyLiquidity, _emptyLiquidity,
+      9, na, na)
+
+phase5_structure_packet(_swingLength) =>
+    [_swingHigh, _swingLow] = swings(_swingLength)
+
+    var float _lastHigh = na
+    var float _lastLow = na
+    var int _state = 0
+    var int _lastBreakDirection = 0
+    var bool _highCanBreak = true
+    var bool _lowCanBreak = true
+
+    if _swingHigh != 0
+        _lastHigh := _swingHigh
+        _highCanBreak := true
+    if _swingLow != 0
+        _lastLow := _swingLow
+        _lowCanBreak := true
+
+    _bullBreak = not na(_lastHigh) and _highCanBreak and ta.crossover(close, _lastHigh)
+    _bearBreak = not na(_lastLow) and _lowCanBreak and ta.crossunder(close, _lastLow)
+
+    if _bullBreak
+        _state := 1
+        _lastBreakDirection := 1
+        _highCanBreak := false
+    else if _bearBreak
+        _state := -1
+        _lastBreakDirection := -1
+        _lowCanBreak := false
+
+    _location = phase5_range_location(close, _lastHigh, _lastLow)
+    [_state[1], _lastHigh[1], _lastLow[1], _lastBreakDirection[1], _location[1]]
+
+phase5_setup_packet() =>
+    _atr200 = ta.atr(200)
+    _meanRange = ta.cum(high - low) / math.max(bar_index, 1)
+    _obThreshold = ob_filter == 'Atr' ? _atr200 : _meanRange
+
+    // Demand/Supply adapter — same displacement/base concept, data only.
+    _bearRun = ta.barssince(open < close)
+    _bullRun = ta.barssince(open > close)
+    var float _s1Level = na
+    var int _s1Time = na
+    _smallBase = get_pc_diff_abs(open[1], close[1]) < 0.02
+    _s1Level := _smallBase and ((_bullRun == 1 and open[2] > close[2]) or (_bearRun == 1 and open[2] < close[2])) ? open[2] :
+      _bullRun == 1 or _bearRun == 1 ? open[1] :
+      _bullRun > 1 or _bearRun > 1 ? _s1Level : na
+    _s1Time := _bullRun == 1 or _bearRun == 1 ? time[1] :
+      _bullRun > 1 or _bearRun > 1 ? _s1Time : na
+
+    var float[] _demandTops = array.new_float()
+    var float[] _demandBottoms = array.new_float()
+    var int[] _demandOrigin = array.new_int()
+    var int[] _demandConfirmed = array.new_int()
+    var bool[] _demandFresh = array.new_bool()
+    var float[] _supplyTops = array.new_float()
+    var float[] _supplyBottoms = array.new_float()
+    var int[] _supplyOrigin = array.new_int()
+    var int[] _supplyConfirmed = array.new_int()
+    var bool[] _supplyFresh = array.new_bool()
+
+    _i = array.size(_demandTops) - 1
+    while _i >= 0
+        if time >= array.get(_demandConfirmed, _i) and low <= array.get(_demandTops, _i)
+            array.remove(_demandTops, _i)
+            array.remove(_demandBottoms, _i)
+            array.remove(_demandOrigin, _i)
+            array.remove(_demandConfirmed, _i)
+            array.remove(_demandFresh, _i)
+        _i -= 1
+
+    _i := array.size(_supplyTops) - 1
+    while _i >= 0
+        if time >= array.get(_supplyConfirmed, _i) and high >= array.get(_supplyBottoms, _i)
+            array.remove(_supplyTops, _i)
+            array.remove(_supplyBottoms, _i)
+            array.remove(_supplyOrigin, _i)
+            array.remove(_supplyConfirmed, _i)
+            array.remove(_supplyFresh, _i)
+        _i -= 1
+
+    _demandBars = _bullRun
+    _validDemandBars = not na(_demandBars) and _demandBars >= 1 and _demandBars < 500
+    _demandChange = _validDemandBars ? get_pc_diff_abs(close, open[_demandBars - 1]) : 0.0
+    _newDemand = _validDemandBars and not na(_s1Time) and not array.includes(_demandOrigin, _s1Time) and _demandChange >= ds_min_pc_change
+    if _newDemand
+        _demandTop = _s1Level
+        _demandBot = math.min(low[_demandBars], low[_demandBars - 1])
+        _demandHeight = get_pc_diff_abs(_demandTop, _demandBot)
+        _baseCandleChange = get_pc_diff_abs(open[_demandBars], close[_demandBars])
+        _demandBot := _demandHeight > ds_max_pc_zone ? get_amount_by_pc(_demandTop, ds_max_pc_zone, 'minus') : _demandBot
+        _demandTop := _demandHeight > ds_max_pc_zone and _baseCandleChange <= ds_max_pc_zone ? _s1Level :
+          _demandHeight > ds_max_pc_zone ? get_amount_by_pc(close[_demandBars], ds_max_pc_zone / 5, 'add') : _demandTop
+        _demandTop := math.round_to_mintick(_demandTop)
+        _demandBot := math.round_to_mintick(_demandBot)
+        // Preserve the Phase 5 zone contract after independent size adjustments:
+        // Top is always the higher boundary and Bottom is always the lower one.
+        _demandHigh = math.max(_demandTop, _demandBot)
+        _demandLow = math.min(_demandTop, _demandBot)
+        _demandTop := _demandHigh
+        _demandBot := _demandLow
+        array.unshift(_demandTops, _demandTop)
+        array.unshift(_demandBottoms, _demandBot)
+        array.unshift(_demandOrigin, _s1Time)
+        array.unshift(_demandConfirmed, time_close)
+        array.unshift(_demandFresh, true)
+
+    _supplyBars = _bearRun
+    _validSupplyBars = not na(_supplyBars) and _supplyBars >= 1 and _supplyBars < 500
+    _supplyChange = _validSupplyBars ? get_pc_diff_abs(close, open[_supplyBars - 1]) : 0.0
+    _newSupply = _validSupplyBars and not na(_s1Time) and not array.includes(_supplyOrigin, _s1Time) and _supplyChange >= ds_min_pc_change
+    if _newSupply
+        _supplyTop = math.max(high[_supplyBars], high[_supplyBars - 1])
+        _supplyBot = _s1Level
+        _supplyHeight = get_pc_diff_abs(_supplyTop, _supplyBot)
+        _baseCandleChange = get_pc_diff_abs(open[_supplyBars], close[_supplyBars])
+        _supplyBot := _supplyHeight > ds_max_pc_zone and _baseCandleChange <= ds_max_pc_zone ? _s1Level :
+          _supplyHeight > ds_max_pc_zone ? get_amount_by_pc(close[_supplyBars], ds_max_pc_zone / 5, 'minus') : _supplyBot
+        _supplyTop := _supplyHeight > ds_max_pc_zone ? get_amount_by_pc(_supplyBot, ds_max_pc_zone, 'add') : _supplyTop
+        _supplyTop := math.round_to_mintick(_supplyTop)
+        _supplyBot := math.round_to_mintick(_supplyBot)
+        // Apply the same defensive boundary contract to Supply candidates.
+        _supplyHigh = math.max(_supplyTop, _supplyBot)
+        _supplyLow = math.min(_supplyTop, _supplyBot)
+        _supplyTop := _supplyHigh
+        _supplyBot := _supplyLow
+        array.unshift(_supplyTops, _supplyTop)
+        array.unshift(_supplyBottoms, _supplyBot)
+        array.unshift(_supplyOrigin, _s1Time)
+        array.unshift(_supplyConfirmed, time_close)
+        array.unshift(_supplyFresh, true)
+
+    if array.size(_demandTops) > phase5ActiveCandidateCap
+        array.pop(_demandTops)
+        array.pop(_demandBottoms)
+        array.pop(_demandOrigin)
+        array.pop(_demandConfirmed)
+        array.pop(_demandFresh)
+    if array.size(_supplyTops) > phase5ActiveCandidateCap
+        array.pop(_supplyTops)
+        array.pop(_supplyBottoms)
+        array.pop(_supplyOrigin)
+        array.pop(_supplyConfirmed)
+        array.pop(_supplyFresh)
+
+    [_demand1Top, _demand1Bottom, _demand1Origin, _demand1Confirmed, _demand1Fresh,
+      _demand2Top, _demand2Bottom, _demand2Origin, _demand2Confirmed, _demand2Fresh,
+      _demand3Top, _demand3Bottom, _demand3Origin, _demand3Confirmed, _demand3Fresh] =
+      phase5_three_candidates(_demandTops, _demandBottoms, _demandOrigin, _demandConfirmed, _demandFresh, 1)
+    [_supply1Top, _supply1Bottom, _supply1Origin, _supply1Confirmed, _supply1Fresh,
+      _supply2Top, _supply2Bottom, _supply2Origin, _supply2Confirmed, _supply2Fresh,
+      _supply3Top, _supply3Bottom, _supply3Origin, _supply3Confirmed, _supply3Fresh] =
+      phase5_three_candidates(_supplyTops, _supplyBottoms, _supplyOrigin, _supplyConfirmed, _supplyFresh, -1)
+
+    // Swing Order Block adapter — exact original SMC swing source and break lock.
+    [_swingTop, _swingBottom] = swings(length)
+    var float _lastSwingHigh = na
+    var float _lastSwingLow = na
+    var int _lastSwingHighBar = na
+    var int _lastSwingLowBar = na
+    var bool _swingHighCanBreak = true
+    var bool _swingLowCanBreak = true
+    if _swingTop != 0
+        _lastSwingHigh := _swingTop
+        _lastSwingHighBar := bar_index - length
+        _swingHighCanBreak := true
+    if _swingBottom != 0
+        _lastSwingLow := _swingBottom
+        _lastSwingLowBar := bar_index - length
+        _swingLowCanBreak := true
+
+    var float[] _bullObTop = array.new_float()
+    var float[] _bullObBottom = array.new_float()
+    var int[] _bullObOrigin = array.new_int()
+    var int[] _bullObConfirmed = array.new_int()
+    var bool[] _bullObFresh = array.new_bool()
+    var float[] _bearObTop = array.new_float()
+    var float[] _bearObBottom = array.new_float()
+    var int[] _bearObOrigin = array.new_int()
+    var int[] _bearObConfirmed = array.new_int()
+    var bool[] _bearObFresh = array.new_bool()
+
+    _i := array.size(_bullObTop) - 1
+    while _i >= 0
+        if close < array.get(_bullObBottom, _i)
+            array.remove(_bullObTop, _i)
+            array.remove(_bullObBottom, _i)
+            array.remove(_bullObOrigin, _i)
+            array.remove(_bullObConfirmed, _i)
+            array.remove(_bullObFresh, _i)
+        _i -= 1
+
+    _i := array.size(_bearObTop) - 1
+    while _i >= 0
+        if close > array.get(_bearObTop, _i)
+            array.remove(_bearObTop, _i)
+            array.remove(_bearObBottom, _i)
+            array.remove(_bearObOrigin, _i)
+            array.remove(_bearObConfirmed, _i)
+            array.remove(_bearObFresh, _i)
+        _i -= 1
+
+    for _zoneIndex = 0 to (array.size(_bullObTop) == 0 ? na : array.size(_bullObTop) - 1)
+        _touched = time >= array.get(_bullObConfirmed, _zoneIndex) and
+          high >= array.get(_bullObBottom, _zoneIndex) and low <= array.get(_bullObTop, _zoneIndex)
+        if _touched
+            array.set(_bullObFresh, _zoneIndex, false)
+
+    for _zoneIndex = 0 to (array.size(_bearObTop) == 0 ? na : array.size(_bearObTop) - 1)
+        _touched = time >= array.get(_bearObConfirmed, _zoneIndex) and
+          high >= array.get(_bearObBottom, _zoneIndex) and low <= array.get(_bearObTop, _zoneIndex)
+        if _touched
+            array.set(_bearObFresh, _zoneIndex, false)
+
+    _bullStructureBreak = not na(_lastSwingHigh) and _swingHighCanBreak and ta.crossover(close, _lastSwingHigh)
+    if _bullStructureBreak and not na(_lastSwingHighBar)
+        _scanBars = math.min(bar_index - _lastSwingHighBar - 1, 499)
+        float _selectedLow = na
+        float _selectedHigh = na
+        int _selectedTime = na
+        if _scanBars >= 1
+            for _scan = 1 to _scanBars
+                if high[_scan] - low[_scan] < _obThreshold[_scan] * 2
+                    if na(_selectedLow) or low[_scan] < _selectedLow
+                        _selectedLow := low[_scan]
+                        _selectedHigh := high[_scan]
+                        _selectedTime := time[_scan]
+        if not na(_selectedLow)
+            array.unshift(_bullObTop, _selectedHigh)
+            array.unshift(_bullObBottom, _selectedLow)
+            array.unshift(_bullObOrigin, _selectedTime)
+            array.unshift(_bullObConfirmed, time_close)
+            array.unshift(_bullObFresh, true)
+        _swingHighCanBreak := false
+
+    _bearStructureBreak = not na(_lastSwingLow) and _swingLowCanBreak and ta.crossunder(close, _lastSwingLow)
+    if _bearStructureBreak and not na(_lastSwingLowBar)
+        _scanBars = math.min(bar_index - _lastSwingLowBar - 1, 499)
+        float _selectedHigh = na
+        float _selectedLow = na
+        int _selectedTime = na
+        if _scanBars >= 1
+            for _scan = 1 to _scanBars
+                if high[_scan] - low[_scan] < _obThreshold[_scan] * 2
+                    if na(_selectedHigh) or high[_scan] > _selectedHigh
+                        _selectedHigh := high[_scan]
+                        _selectedLow := low[_scan]
+                        _selectedTime := time[_scan]
+        if not na(_selectedHigh)
+            array.unshift(_bearObTop, _selectedHigh)
+            array.unshift(_bearObBottom, _selectedLow)
+            array.unshift(_bearObOrigin, _selectedTime)
+            array.unshift(_bearObConfirmed, time_close)
+            array.unshift(_bearObFresh, true)
+        _swingLowCanBreak := false
+
+    if array.size(_bullObTop) > phase5ActiveCandidateCap
+        array.pop(_bullObTop)
+        array.pop(_bullObBottom)
+        array.pop(_bullObOrigin)
+        array.pop(_bullObConfirmed)
+        array.pop(_bullObFresh)
+    if array.size(_bearObTop) > phase5ActiveCandidateCap
+        array.pop(_bearObTop)
+        array.pop(_bearObBottom)
+        array.pop(_bearObOrigin)
+        array.pop(_bearObConfirmed)
+        array.pop(_bearObFresh)
+
+    [_bullOb1Top, _bullOb1Bottom, _bullOb1Origin, _bullOb1Confirmed, _bullOb1Fresh,
+      _bullOb2Top, _bullOb2Bottom, _bullOb2Origin, _bullOb2Confirmed, _bullOb2Fresh,
+      _bullOb3Top, _bullOb3Bottom, _bullOb3Origin, _bullOb3Confirmed, _bullOb3Fresh] =
+      phase5_three_candidates(_bullObTop, _bullObBottom, _bullObOrigin, _bullObConfirmed, _bullObFresh, 1)
+    [_bearOb1Top, _bearOb1Bottom, _bearOb1Origin, _bearOb1Confirmed, _bearOb1Fresh,
+      _bearOb2Top, _bearOb2Bottom, _bearOb2Origin, _bearOb2Confirmed, _bearOb2Fresh,
+      _bearOb3Top, _bearOb3Bottom, _bearOb3Origin, _bearOb3Confirmed, _bearOb3Fresh] =
+      phase5_three_candidates(_bearObTop, _bearObBottom, _bearObOrigin, _bearObConfirmed, _bearObFresh, -1)
+
+    // FVG adapter — same three-candle imbalance concept, data only.
+    var float[] _bullFvgTop = array.new_float()
+    var float[] _bullFvgBottom = array.new_float()
+    var int[] _bullFvgOrigin = array.new_int()
+    var int[] _bullFvgConfirmed = array.new_int()
+    var bool[] _bullFvgFresh = array.new_bool()
+    var float[] _bearFvgTop = array.new_float()
+    var float[] _bearFvgBottom = array.new_float()
+    var int[] _bearFvgOrigin = array.new_int()
+    var int[] _bearFvgConfirmed = array.new_int()
+    var bool[] _bearFvgFresh = array.new_bool()
+
+    _i := array.size(_bullFvgTop) - 1
+    while _i >= 0
+        if low < array.get(_bullFvgBottom, _i)
+            array.remove(_bullFvgTop, _i)
+            array.remove(_bullFvgBottom, _i)
+            array.remove(_bullFvgOrigin, _i)
+            array.remove(_bullFvgConfirmed, _i)
+            array.remove(_bullFvgFresh, _i)
+        _i -= 1
+
+    _i := array.size(_bearFvgTop) - 1
+    while _i >= 0
+        if high > array.get(_bearFvgTop, _i)
+            array.remove(_bearFvgTop, _i)
+            array.remove(_bearFvgBottom, _i)
+            array.remove(_bearFvgOrigin, _i)
+            array.remove(_bearFvgConfirmed, _i)
+            array.remove(_bearFvgFresh, _i)
+        _i -= 1
+
+    for _zoneIndex = 0 to (array.size(_bullFvgTop) == 0 ? na : array.size(_bullFvgTop) - 1)
+        _touched = time >= array.get(_bullFvgConfirmed, _zoneIndex) and
+          high >= array.get(_bullFvgBottom, _zoneIndex) and low <= array.get(_bullFvgTop, _zoneIndex)
+        if _touched
+            array.set(_bullFvgFresh, _zoneIndex, false)
+
+    for _zoneIndex = 0 to (array.size(_bearFvgTop) == 0 ? na : array.size(_bearFvgTop) - 1)
+        _touched = time >= array.get(_bearFvgConfirmed, _zoneIndex) and
+          high >= array.get(_bearFvgBottom, _zoneIndex) and low <= array.get(_bearFvgTop, _zoneIndex)
+        if _touched
+            array.set(_bearFvgFresh, _zoneIndex, false)
+
+    _deltaPercent = (close[1] - open[1]) / open[1] * 100
+    _fvgThreshold = fvg_auto ? ta.cum(math.abs(_deltaPercent)) / math.max(bar_index, 1) * 2 : 0.0
+    _newBullFvg = low > high[2] and close[1] > high[2] and _deltaPercent > _fvgThreshold
+    _newBearFvg = high < low[2] and close[1] < low[2] and -_deltaPercent > _fvgThreshold
+    if _newBullFvg
+        array.unshift(_bullFvgTop, low)
+        array.unshift(_bullFvgBottom, high[2])
+        array.unshift(_bullFvgOrigin, time[1])
+        array.unshift(_bullFvgConfirmed, time_close)
+        array.unshift(_bullFvgFresh, true)
+    if _newBearFvg
+        array.unshift(_bearFvgTop, low[2])
+        array.unshift(_bearFvgBottom, high)
+        array.unshift(_bearFvgOrigin, time[1])
+        array.unshift(_bearFvgConfirmed, time_close)
+        array.unshift(_bearFvgFresh, true)
+
+    if array.size(_bullFvgTop) > phase5ActiveCandidateCap
+        array.pop(_bullFvgTop)
+        array.pop(_bullFvgBottom)
+        array.pop(_bullFvgOrigin)
+        array.pop(_bullFvgConfirmed)
+        array.pop(_bullFvgFresh)
+    if array.size(_bearFvgTop) > phase5ActiveCandidateCap
+        array.pop(_bearFvgTop)
+        array.pop(_bearFvgBottom)
+        array.pop(_bearFvgOrigin)
+        array.pop(_bearFvgConfirmed)
+        array.pop(_bearFvgFresh)
+
+    [_bullFvg1Top, _bullFvg1Bottom, _bullFvg1Origin, _bullFvg1Confirmed, _bullFvg1Fresh,
+      _bullFvg2Top, _bullFvg2Bottom, _bullFvg2Origin, _bullFvg2Confirmed, _bullFvg2Fresh,
+      _bullFvg3Top, _bullFvg3Bottom, _bullFvg3Origin, _bullFvg3Confirmed, _bullFvg3Fresh] =
+      phase5_three_candidates(_bullFvgTop, _bullFvgBottom, _bullFvgOrigin, _bullFvgConfirmed, _bullFvgFresh, 0)
+    [_bearFvg1Top, _bearFvg1Bottom, _bearFvg1Origin, _bearFvg1Confirmed, _bearFvg1Fresh,
+      _bearFvg2Top, _bearFvg2Bottom, _bearFvg2Origin, _bearFvg2Confirmed, _bearFvg2Fresh,
+      _bearFvg3Top, _bearFvg3Bottom, _bearFvg3Origin, _bearFvg3Confirmed, _bearFvg3Fresh] =
+      phase5_three_candidates(_bearFvgTop, _bearFvgBottom, _bearFvgOrigin, _bearFvgConfirmed, _bearFvgFresh, 0)
+
+    // Pivot S/R adapter — configured source, sizing, alignment, and polarity flips.
+    [_setupHaOpen, _setupHaClose] = _haBody()
+    _setupSourceHigh = src == 'HA' ? math.max(_setupHaOpen, _setupHaClose) : src == 'High/Low' ? high : math.max(open, close)
+    _setupSourceLow = src == 'HA' ? math.min(_setupHaOpen, _setupHaClose) : src == 'High/Low' ? low : math.min(open, close)
+    _setupPivotHigh = ta.pivothigh(_setupSourceHigh, left, right)
+    _setupPivotLow = ta.pivotlow(_setupSourceLow, left, right)
+    _setupPivotAtr = ta.atr(atrLen)
+    _setupBand = math.min(_setupPivotAtr * mult, close * (per / 100))[right] / 2
+
+    var float[] _pivotHighTops = array.new_float()
+    var float[] _pivotHighBottoms = array.new_float()
+    var bool[] _pivotHighBullish = array.new_bool()
+    var int[] _pivotHighOrigin = array.new_int()
+    var int[] _pivotHighConfirmed = array.new_int()
+    var bool[] _pivotHighFresh = array.new_bool()
+    var float[] _pivotLowTops = array.new_float()
+    var float[] _pivotLowBottoms = array.new_float()
+    var bool[] _pivotLowBullish = array.new_bool()
+    var int[] _pivotLowOrigin = array.new_int()
+    var int[] _pivotLowConfirmed = array.new_int()
+    var bool[] _pivotLowFresh = array.new_bool()
+    _pivotRetention = math.min(phase5ActiveCandidateCap, math.max(nPiv, 3))
+
+    if not na(_setupPivotHigh) and dhighs
+        array.unshift(_pivotHighTops, _setupPivotHigh + _setupBand)
+        array.unshift(_pivotHighBottoms, _setupPivotHigh - _setupBand)
+        array.unshift(_pivotHighBullish, false)
+        array.unshift(_pivotHighOrigin, time[right])
+        array.unshift(_pivotHighConfirmed, time_close)
+        array.unshift(_pivotHighFresh, true)
+        if array.size(_pivotHighTops) > _pivotRetention
+            array.pop(_pivotHighTops)
+            array.pop(_pivotHighBottoms)
+            array.pop(_pivotHighBullish)
+            array.pop(_pivotHighOrigin)
+            array.pop(_pivotHighConfirmed)
+            array.pop(_pivotHighFresh)
+
+    if not na(_setupPivotLow) and dlows
+        array.unshift(_pivotLowTops, _setupPivotLow + _setupBand)
+        array.unshift(_pivotLowBottoms, _setupPivotLow - _setupBand)
+        array.unshift(_pivotLowBullish, true)
+        array.unshift(_pivotLowOrigin, time[right])
+        array.unshift(_pivotLowConfirmed, time_close)
+        array.unshift(_pivotLowFresh, true)
+        if array.size(_pivotLowTops) > _pivotRetention
+            array.pop(_pivotLowTops)
+            array.pop(_pivotLowBottoms)
+            array.pop(_pivotLowBullish)
+            array.pop(_pivotLowOrigin)
+            array.pop(_pivotLowConfirmed)
+            array.pop(_pivotLowFresh)
+
+    if alignZones
+        phase5_align_zone_arrays(_pivotHighTops, _pivotHighBottoms, _pivotHighOrigin, _pivotHighConfirmed, _pivotHighFresh, _pivotHighTops, _pivotHighBottoms, _pivotHighOrigin, _pivotHighConfirmed, _pivotHighFresh)
+        phase5_align_zone_arrays(_pivotHighTops, _pivotHighBottoms, _pivotHighOrigin, _pivotHighConfirmed, _pivotHighFresh, _pivotLowTops, _pivotLowBottoms, _pivotLowOrigin, _pivotLowConfirmed, _pivotLowFresh)
+        phase5_align_zone_arrays(_pivotLowTops, _pivotLowBottoms, _pivotLowOrigin, _pivotLowConfirmed, _pivotLowFresh, _pivotLowTops, _pivotLowBottoms, _pivotLowOrigin, _pivotLowConfirmed, _pivotLowFresh)
+        phase5_align_zone_arrays(_pivotLowTops, _pivotLowBottoms, _pivotLowOrigin, _pivotLowConfirmed, _pivotLowFresh, _pivotHighTops, _pivotHighBottoms, _pivotHighOrigin, _pivotHighConfirmed, _pivotHighFresh)
+
+    for _zoneIndex = 0 to (array.size(_pivotHighTops) == 0 ? na : array.size(_pivotHighTops) - 1)
+        _zoneTop = array.get(_pivotHighTops, _zoneIndex)
+        _zoneBottom = array.get(_pivotHighBottoms, _zoneIndex)
+        _zoneBullish = array.get(_pivotHighBullish, _zoneIndex)
+        if close > _zoneTop and not _zoneBullish
+            array.set(_pivotHighBullish, _zoneIndex, true)
+        else if close < _zoneBottom and _zoneBullish
+            array.set(_pivotHighBullish, _zoneIndex, false)
+        _touched = time >= array.get(_pivotHighConfirmed, _zoneIndex) and high >= _zoneBottom and low <= _zoneTop
+        if _touched
+            array.set(_pivotHighFresh, _zoneIndex, false)
+
+    for _zoneIndex = 0 to (array.size(_pivotLowTops) == 0 ? na : array.size(_pivotLowTops) - 1)
+        _zoneTop = array.get(_pivotLowTops, _zoneIndex)
+        _zoneBottom = array.get(_pivotLowBottoms, _zoneIndex)
+        _zoneBullish = array.get(_pivotLowBullish, _zoneIndex)
+        if close > _zoneTop and not _zoneBullish
+            array.set(_pivotLowBullish, _zoneIndex, true)
+        else if close < _zoneBottom and _zoneBullish
+            array.set(_pivotLowBullish, _zoneIndex, false)
+        _touched = time >= array.get(_pivotLowConfirmed, _zoneIndex) and high >= _zoneBottom and low <= _zoneTop
+        if _touched
+            array.set(_pivotLowFresh, _zoneIndex, false)
+
+    _pivotSupportTops = array.new_float(0)
+    _pivotSupportBottoms = array.new_float(0)
+    _pivotSupportOrigin = array.new_int(0)
+    _pivotSupportConfirmed = array.new_int(0)
+    _pivotSupportFresh = array.new_bool(0)
+    _pivotResistanceTops = array.new_float(0)
+    _pivotResistanceBottoms = array.new_float(0)
+    _pivotResistanceOrigin = array.new_int(0)
+    _pivotResistanceConfirmed = array.new_int(0)
+    _pivotResistanceFresh = array.new_bool(0)
+
+    for _zoneIndex = 0 to (array.size(_pivotHighTops) == 0 ? na : array.size(_pivotHighTops) - 1)
+        _zoneTop = array.get(_pivotHighTops, _zoneIndex)
+        _zoneBottom = array.get(_pivotHighBottoms, _zoneIndex)
+        if array.get(_pivotHighBullish, _zoneIndex)
+            array.push(_pivotSupportTops, _zoneTop)
+            array.push(_pivotSupportBottoms, _zoneBottom)
+            array.push(_pivotSupportOrigin, array.get(_pivotHighOrigin, _zoneIndex))
+            array.push(_pivotSupportConfirmed, array.get(_pivotHighConfirmed, _zoneIndex))
+            array.push(_pivotSupportFresh, array.get(_pivotHighFresh, _zoneIndex))
+        else
+            array.push(_pivotResistanceTops, _zoneTop)
+            array.push(_pivotResistanceBottoms, _zoneBottom)
+            array.push(_pivotResistanceOrigin, array.get(_pivotHighOrigin, _zoneIndex))
+            array.push(_pivotResistanceConfirmed, array.get(_pivotHighConfirmed, _zoneIndex))
+            array.push(_pivotResistanceFresh, array.get(_pivotHighFresh, _zoneIndex))
+
+    for _zoneIndex = 0 to (array.size(_pivotLowTops) == 0 ? na : array.size(_pivotLowTops) - 1)
+        _zoneTop = array.get(_pivotLowTops, _zoneIndex)
+        _zoneBottom = array.get(_pivotLowBottoms, _zoneIndex)
+        if array.get(_pivotLowBullish, _zoneIndex)
+            array.push(_pivotSupportTops, _zoneTop)
+            array.push(_pivotSupportBottoms, _zoneBottom)
+            array.push(_pivotSupportOrigin, array.get(_pivotLowOrigin, _zoneIndex))
+            array.push(_pivotSupportConfirmed, array.get(_pivotLowConfirmed, _zoneIndex))
+            array.push(_pivotSupportFresh, array.get(_pivotLowFresh, _zoneIndex))
+        else
+            array.push(_pivotResistanceTops, _zoneTop)
+            array.push(_pivotResistanceBottoms, _zoneBottom)
+            array.push(_pivotResistanceOrigin, array.get(_pivotLowOrigin, _zoneIndex))
+            array.push(_pivotResistanceConfirmed, array.get(_pivotLowConfirmed, _zoneIndex))
+            array.push(_pivotResistanceFresh, array.get(_pivotLowFresh, _zoneIndex))
+
+    [_pivotSupport1Top, _pivotSupport1Bottom, _pivotSupport1Origin, _pivotSupport1Confirmed, _pivotSupport1Fresh,
+      _pivotSupport2Top, _pivotSupport2Bottom, _pivotSupport2Origin, _pivotSupport2Confirmed, _pivotSupport2Fresh,
+      _pivotSupport3Top, _pivotSupport3Bottom, _pivotSupport3Origin, _pivotSupport3Confirmed, _pivotSupport3Fresh] =
+      phase5_three_candidates(_pivotSupportTops, _pivotSupportBottoms, _pivotSupportOrigin, _pivotSupportConfirmed, _pivotSupportFresh, 1)
+    [_pivotResistance1Top, _pivotResistance1Bottom, _pivotResistance1Origin, _pivotResistance1Confirmed, _pivotResistance1Fresh,
+      _pivotResistance2Top, _pivotResistance2Bottom, _pivotResistance2Origin, _pivotResistance2Confirmed, _pivotResistance2Fresh,
+      _pivotResistance3Top, _pivotResistance3Bottom, _pivotResistance3Origin, _pivotResistance3Confirmed, _pivotResistance3Fresh] =
+      phase5_three_candidates(_pivotResistanceTops, _pivotResistanceBottoms, _pivotResistanceOrigin, _pivotResistanceConfirmed, _pivotResistanceFresh, -1)
+
+    // EQH/EQL adapter — active nearby liquidity levels, kept separate from zones.
+    _eqTop = ta.pivothigh(eq_len, eq_len)
+    _eqBottom = ta.pivotlow(eq_len, eq_len)
+    var float _previousEqTop = na
+    var float _previousEqBottom = na
+    var int _previousEqTopTime = na
+    var int _previousEqBottomTime = na
+    var float[] _eqhLevels = array.new_float()
+    var int[] _eqhOrigin = array.new_int()
+    var int[] _eqhConfirmed = array.new_int()
+    var float[] _eqlLevels = array.new_float()
+    var int[] _eqlOrigin = array.new_int()
+    var int[] _eqlConfirmed = array.new_int()
+
+    _i := array.size(_eqhLevels) - 1
+    while _i >= 0
+        if time >= array.get(_eqhConfirmed, _i) and high > array.get(_eqhLevels, _i)
+            array.remove(_eqhLevels, _i)
+            array.remove(_eqhOrigin, _i)
+            array.remove(_eqhConfirmed, _i)
+        _i -= 1
+
+    _i := array.size(_eqlLevels) - 1
+    while _i >= 0
+        if time >= array.get(_eqlConfirmed, _i) and low < array.get(_eqlLevels, _i)
+            array.remove(_eqlLevels, _i)
+            array.remove(_eqlOrigin, _i)
+            array.remove(_eqlConfirmed, _i)
+        _i -= 1
+
+    if not na(_eqTop)
+        if not na(_previousEqTop) and math.max(_eqTop, _previousEqTop) < math.min(_eqTop, _previousEqTop) + _atr200 * eq_threshold
+            if not array.includes(_eqhLevels, _eqTop)
+                array.unshift(_eqhLevels, _eqTop)
+                array.unshift(_eqhOrigin, _previousEqTopTime)
+                array.unshift(_eqhConfirmed, time_close)
+        _previousEqTop := _eqTop
+        _previousEqTopTime := time[eq_len]
+    if not na(_eqBottom)
+        if not na(_previousEqBottom) and math.min(_eqBottom, _previousEqBottom) > math.max(_eqBottom, _previousEqBottom) - _atr200 * eq_threshold
+            if not array.includes(_eqlLevels, _eqBottom)
+                array.unshift(_eqlLevels, _eqBottom)
+                array.unshift(_eqlOrigin, _previousEqBottomTime)
+                array.unshift(_eqlConfirmed, time_close)
+        _previousEqBottom := _eqBottom
+        _previousEqBottomTime := time[eq_len]
+
+    if array.size(_eqhLevels) > phase5ActiveCandidateCap
+        array.pop(_eqhLevels)
+        array.pop(_eqhOrigin)
+        array.pop(_eqhConfirmed)
+    if array.size(_eqlLevels) > phase5ActiveCandidateCap
+        array.pop(_eqlLevels)
+        array.pop(_eqlOrigin)
+        array.pop(_eqlConfirmed)
+
+    [_eqh1, _eqh1Origin, _eqh1Confirmed, _eqh2, _eqh2Origin, _eqh2Confirmed, _eqh3, _eqh3Origin, _eqh3Confirmed] =
+      phase5_three_liquidity_levels(_eqhLevels, _eqhOrigin, _eqhConfirmed, true)
+    [_eql1, _eql1Origin, _eql1Confirmed, _eql2, _eql2Origin, _eql2Confirmed, _eql3, _eql3Origin, _eql3Confirmed] =
+      phase5_three_liquidity_levels(_eqlLevels, _eqlOrigin, _eqlConfirmed, false)
+
+    _setupLocation = phase5_range_location(close, _lastSwingHigh, _lastSwingLow)
+
+    // Transport only primitive series across the 15m request boundary. Returning
+    // the former nested UDT allocated 31 objects per requested bar and exhausted
+    // TradingView memory during replay. The omitted FVG/liquidity timestamps were
+    // compatibility-only aliases and are not consumed by Phase 6, targets, UI,
+    // alerts, or bridge plots. All decision-bearing values remain byte-for-byte
+    // the same expressions and retain the same confirmed-bar [1] offset.
+    [_demand1Top[1], _demand1Bottom[1], _demand1Origin[1], _demand1Confirmed[1], _demand1Fresh[1],
+      _demand2Top[1], _demand2Bottom[1], _demand2Origin[1], _demand2Confirmed[1], _demand2Fresh[1],
+      _demand3Top[1], _demand3Bottom[1], _demand3Origin[1], _demand3Confirmed[1], _demand3Fresh[1],
+      _supply1Top[1], _supply1Bottom[1], _supply1Origin[1], _supply1Confirmed[1], _supply1Fresh[1],
+      _supply2Top[1], _supply2Bottom[1], _supply2Origin[1], _supply2Confirmed[1], _supply2Fresh[1],
+      _supply3Top[1], _supply3Bottom[1], _supply3Origin[1], _supply3Confirmed[1], _supply3Fresh[1],
+      _bullOb1Top[1], _bullOb1Bottom[1], _bullOb1Origin[1], _bullOb1Confirmed[1], _bullOb1Fresh[1],
+      _bullOb2Top[1], _bullOb2Bottom[1], _bullOb2Origin[1], _bullOb2Confirmed[1], _bullOb2Fresh[1],
+      _bullOb3Top[1], _bullOb3Bottom[1], _bullOb3Origin[1], _bullOb3Confirmed[1], _bullOb3Fresh[1],
+      _bearOb1Top[1], _bearOb1Bottom[1], _bearOb1Origin[1], _bearOb1Confirmed[1], _bearOb1Fresh[1],
+      _bearOb2Top[1], _bearOb2Bottom[1], _bearOb2Origin[1], _bearOb2Confirmed[1], _bearOb2Fresh[1],
+      _bearOb3Top[1], _bearOb3Bottom[1], _bearOb3Origin[1], _bearOb3Confirmed[1], _bearOb3Fresh[1],
+      _bullFvg1Top[1], _bullFvg1Bottom[1], _bullFvg1Fresh[1],
+      _bullFvg2Top[1], _bullFvg2Bottom[1], _bullFvg2Fresh[1],
+      _bullFvg3Top[1], _bullFvg3Bottom[1], _bullFvg3Fresh[1],
+      _bearFvg1Top[1], _bearFvg1Bottom[1], _bearFvg1Fresh[1],
+      _bearFvg2Top[1], _bearFvg2Bottom[1], _bearFvg2Fresh[1],
+      _bearFvg3Top[1], _bearFvg3Bottom[1], _bearFvg3Fresh[1],
+      _pivotSupport1Top[1], _pivotSupport1Bottom[1], _pivotSupport1Origin[1], _pivotSupport1Confirmed[1], _pivotSupport1Fresh[1],
+      _pivotSupport2Top[1], _pivotSupport2Bottom[1], _pivotSupport2Origin[1], _pivotSupport2Confirmed[1], _pivotSupport2Fresh[1],
+      _pivotSupport3Top[1], _pivotSupport3Bottom[1], _pivotSupport3Origin[1], _pivotSupport3Confirmed[1], _pivotSupport3Fresh[1],
+      _pivotResistance1Top[1], _pivotResistance1Bottom[1], _pivotResistance1Origin[1], _pivotResistance1Confirmed[1], _pivotResistance1Fresh[1],
+      _pivotResistance2Top[1], _pivotResistance2Bottom[1], _pivotResistance2Origin[1], _pivotResistance2Confirmed[1], _pivotResistance2Fresh[1],
+      _pivotResistance3Top[1], _pivotResistance3Bottom[1], _pivotResistance3Origin[1], _pivotResistance3Confirmed[1], _pivotResistance3Fresh[1],
+      _eqh1[1], _eqh2[1], _eqh3[1], _eql1[1], _eql2[1], _eql3[1],
+      _setupLocation[1], _lastSwingHigh[1], _lastSwingLow[1]]
+
+// Safe confirmed OHLC feeds are exposed for inspection and future Phase-6 use.
+[phase5MacroOpen, phase5MacroHighBar, phase5MacroLowBar, phase5MacroClose, phase5MacroTime] = phase5_confirmed_ohlc(phase5MacroTf)
+[phase5BiasOpen, phase5BiasHighBar, phase5BiasLowBar, phase5BiasClose, phase5BiasTime] = phase5_confirmed_ohlc(phase5BiasTf)
+[phase5SetupOpen, phase5SetupHighBar, phase5SetupLowBar, phase5SetupClose, phase5SetupTime] = phase5_confirmed_ohlc(phase5SetupTf)
+
+// Safe data-only liquidity references from fully completed calendar periods.
+// The original optional D/W/M drawings remain untouched and independent.
+[phase5PrevDayHighRaw, phase5PrevDayLowRaw] = phase5_confirmed_previous_hl('D')
+[phase5PrevWeekHighRaw, phase5PrevWeekLowRaw] = phase5_confirmed_previous_hl('W')
+[phase5PrevMonthHighRaw, phase5PrevMonthLowRaw] = phase5_confirmed_previous_hl('M')
+
+// -----------------------------------------------------------------------------
+// PHASE 5 / PIECE 3 OF 8 — 4H Macro Context Module
+// -----------------------------------------------------------------------------
+[phase5MacroBiasRaw, phase5MacroSwingHigh, phase5MacroSwingLow, phase5MacroBreakDirection, phase5MacroLocation] =
+  request.security(syminfo.tickerid, phase5MacroTf, phase5_structure_packet(length), lookahead=barmerge.lookahead_on)
+
+phase5MacroRange = not na(phase5MacroSwingHigh) and not na(phase5MacroSwingLow) ? phase5MacroSwingHigh - phase5MacroSwingLow : na
+
+// -----------------------------------------------------------------------------
+// PHASE 5 / PIECE 4 OF 8 — 1H Primary Bias Module
+// -----------------------------------------------------------------------------
+[phase5Bias1HRaw, phase5Bias1HSwingHigh, phase5Bias1HSwingLow, phase5Bias1HBreakDirection, phase5Bias1HLocation] =
+  request.security(syminfo.tickerid, phase5BiasTf, phase5_structure_packet(length), lookahead=barmerge.lookahead_on)
+
+// -----------------------------------------------------------------------------
+// PHASE 5 / PIECE 5 OF 8 — 15m Setup / AOI Module
+// Separate outputs remain separate; this module does not calculate an AOI score.
+// -----------------------------------------------------------------------------
+[phase5SetupDemand1TopRaw, phase5SetupDemand1BottomRaw, phase5SetupDemand1OriginRaw, phase5SetupDemand1ConfirmedRaw, phase5SetupDemand1FreshRaw,
+  phase5SetupDemand2TopRaw, phase5SetupDemand2BottomRaw, phase5SetupDemand2OriginRaw, phase5SetupDemand2ConfirmedRaw, phase5SetupDemand2FreshRaw,
+  phase5SetupDemand3TopRaw, phase5SetupDemand3BottomRaw, phase5SetupDemand3OriginRaw, phase5SetupDemand3ConfirmedRaw, phase5SetupDemand3FreshRaw,
+  phase5SetupSupply1TopRaw, phase5SetupSupply1BottomRaw, phase5SetupSupply1OriginRaw, phase5SetupSupply1ConfirmedRaw, phase5SetupSupply1FreshRaw,
+  phase5SetupSupply2TopRaw, phase5SetupSupply2BottomRaw, phase5SetupSupply2OriginRaw, phase5SetupSupply2ConfirmedRaw, phase5SetupSupply2FreshRaw,
+  phase5SetupSupply3TopRaw, phase5SetupSupply3BottomRaw, phase5SetupSupply3OriginRaw, phase5SetupSupply3ConfirmedRaw, phase5SetupSupply3FreshRaw,
+  phase5SetupBullOB1TopRaw, phase5SetupBullOB1BottomRaw, phase5SetupBullOB1OriginRaw, phase5SetupBullOB1ConfirmedRaw, phase5SetupBullOB1FreshRaw,
+  phase5SetupBullOB2TopRaw, phase5SetupBullOB2BottomRaw, phase5SetupBullOB2OriginRaw, phase5SetupBullOB2ConfirmedRaw, phase5SetupBullOB2FreshRaw,
+  phase5SetupBullOB3TopRaw, phase5SetupBullOB3BottomRaw, phase5SetupBullOB3OriginRaw, phase5SetupBullOB3ConfirmedRaw, phase5SetupBullOB3FreshRaw,
+  phase5SetupBearOB1TopRaw, phase5SetupBearOB1BottomRaw, phase5SetupBearOB1OriginRaw, phase5SetupBearOB1ConfirmedRaw, phase5SetupBearOB1FreshRaw,
+  phase5SetupBearOB2TopRaw, phase5SetupBearOB2BottomRaw, phase5SetupBearOB2OriginRaw, phase5SetupBearOB2ConfirmedRaw, phase5SetupBearOB2FreshRaw,
+  phase5SetupBearOB3TopRaw, phase5SetupBearOB3BottomRaw, phase5SetupBearOB3OriginRaw, phase5SetupBearOB3ConfirmedRaw, phase5SetupBearOB3FreshRaw,
+  phase5SetupBullFVG1TopRaw, phase5SetupBullFVG1BottomRaw, phase5SetupBullFVG1FreshRaw,
+  phase5SetupBullFVG2TopRaw, phase5SetupBullFVG2BottomRaw, phase5SetupBullFVG2FreshRaw,
+  phase5SetupBullFVG3TopRaw, phase5SetupBullFVG3BottomRaw, phase5SetupBullFVG3FreshRaw,
+  phase5SetupBearFVG1TopRaw, phase5SetupBearFVG1BottomRaw, phase5SetupBearFVG1FreshRaw,
+  phase5SetupBearFVG2TopRaw, phase5SetupBearFVG2BottomRaw, phase5SetupBearFVG2FreshRaw,
+  phase5SetupBearFVG3TopRaw, phase5SetupBearFVG3BottomRaw, phase5SetupBearFVG3FreshRaw,
+  phase5SetupPivotSupport1TopRaw, phase5SetupPivotSupport1BottomRaw, phase5SetupPivotSupport1OriginRaw, phase5SetupPivotSupport1ConfirmedRaw, phase5SetupPivotSupport1FreshRaw,
+  phase5SetupPivotSupport2TopRaw, phase5SetupPivotSupport2BottomRaw, phase5SetupPivotSupport2OriginRaw, phase5SetupPivotSupport2ConfirmedRaw, phase5SetupPivotSupport2FreshRaw,
+  phase5SetupPivotSupport3TopRaw, phase5SetupPivotSupport3BottomRaw, phase5SetupPivotSupport3OriginRaw, phase5SetupPivotSupport3ConfirmedRaw, phase5SetupPivotSupport3FreshRaw,
+  phase5SetupPivotResistance1TopRaw, phase5SetupPivotResistance1BottomRaw, phase5SetupPivotResistance1OriginRaw, phase5SetupPivotResistance1ConfirmedRaw, phase5SetupPivotResistance1FreshRaw,
+  phase5SetupPivotResistance2TopRaw, phase5SetupPivotResistance2BottomRaw, phase5SetupPivotResistance2OriginRaw, phase5SetupPivotResistance2ConfirmedRaw, phase5SetupPivotResistance2FreshRaw,
+  phase5SetupPivotResistance3TopRaw, phase5SetupPivotResistance3BottomRaw, phase5SetupPivotResistance3OriginRaw, phase5SetupPivotResistance3ConfirmedRaw, phase5SetupPivotResistance3FreshRaw,
+  phase5SetupEQH1Raw, phase5SetupEQH2Raw, phase5SetupEQH3Raw, phase5SetupEQL1Raw, phase5SetupEQL2Raw, phase5SetupEQL3Raw,
+  phase5SetupLocationRaw, phase5SetupSwingHighRaw, phase5SetupSwingLowRaw] =
+  request.security(syminfo.tickerid, phase5SetupTf, phase5_setup_packet(), lookahead=barmerge.lookahead_on, calc_bars_count=phase5SetupHistoryBars)
+
+// -----------------------------------------------------------------------------
+// PHASE 5 / PIECE 6 OF 8 — 5m Execution Context Module
+// Reuses current-chart engines and publishes both live and confirmed states.
+// -----------------------------------------------------------------------------
+phase5ExecInternalTrendLive = itrend
+phase5ExecSwingTrendLive = trend
+phase5ExecTrendLive = phase5ExecInternalTrendLive
+phase5ExecInternalBullChochLive = bull_ichoch_alert
+phase5ExecInternalBearChochLive = bear_ichoch_alert
+phase5ExecSwingBullChochLive = bull_choch_alert
+phase5ExecSwingBearChochLive = bear_choch_alert
+phase5ExecInternalBullBreakLive = bull_ibreak_alert
+phase5ExecInternalBearBreakLive = bear_ibreak_alert
+phase5ExecBullChochLive = phase5ExecInternalBullChochLive or phase5ExecSwingBullChochLive
+phase5ExecBearChochLive = phase5ExecInternalBearChochLive or phase5ExecSwingBearChochLive
+
+phase5ExecAtrLive = atrv
+
+phase5ExecInternalTrendConfirmed = barstate.isconfirmed ? phase5ExecInternalTrendLive : phase5ExecInternalTrendLive[1]
+phase5ExecSwingTrendConfirmed = barstate.isconfirmed ? phase5ExecSwingTrendLive : phase5ExecSwingTrendLive[1]
+phase5ExecTrendConfirmed = phase5ExecInternalTrendConfirmed
+phase5ExecInternalBullChochConfirmed = barstate.isconfirmed ? phase5ExecInternalBullChochLive : phase5ExecInternalBullChochLive[1]
+phase5ExecInternalBearChochConfirmed = barstate.isconfirmed ? phase5ExecInternalBearChochLive : phase5ExecInternalBearChochLive[1]
+phase5ExecInternalBullBreakConfirmed = barstate.isconfirmed ? phase5ExecInternalBullBreakLive : phase5ExecInternalBullBreakLive[1]
+phase5ExecInternalBearBreakConfirmed = barstate.isconfirmed ? phase5ExecInternalBearBreakLive : phase5ExecInternalBearBreakLive[1]
+phase5ExecSwingBullChochConfirmed = barstate.isconfirmed ? phase5ExecSwingBullChochLive : phase5ExecSwingBullChochLive[1]
+phase5ExecSwingBearChochConfirmed = barstate.isconfirmed ? phase5ExecSwingBearChochLive : phase5ExecSwingBearChochLive[1]
+phase5ExecBullChochConfirmed = barstate.isconfirmed ? phase5ExecBullChochLive : phase5ExecBullChochLive[1]
+phase5ExecBearChochConfirmed = barstate.isconfirmed ? phase5ExecBearChochLive : phase5ExecBearChochLive[1]
+phase5ExecAtrConfirmed = barstate.isconfirmed ? phase5ExecAtrLive : phase5ExecAtrLive[1]
+
+// -----------------------------------------------------------------------------
+// PHASE 5 / PIECE 8 OF 8 — MTF State Interface + Debug Table
+// These aliases are the stable contract that Phase 6 can consume later.
+// -----------------------------------------------------------------------------
+macro4HBias = phase5MacroBiasRaw
+macro4HHigh = phase5MacroSwingHigh
+macro4HLow = phase5MacroSwingLow
+macro4HBreak = phase5MacroBreakDirection
+macro4HRange = phase5MacroRange
+
+bias1H = phase5Bias1HRaw
+bias1HBreak = phase5Bias1HBreakDirection
+bias1HLocation = phase5Bias1HLocation
+
+prevDayHigh = phase5PrevDayHighRaw
+prevDayLow = phase5PrevDayLowRaw
+prevWeekHigh = phase5PrevWeekHighRaw
+prevWeekLow = phase5PrevWeekLowRaw
+prevMonthHigh = phase5PrevMonthHighRaw
+prevMonthLow = phase5PrevMonthLowRaw
+
+// Each AOI family publishes its nearest three active candidates. Origin is the
+// source candle/pivot time, Confirmed is when the zone became knowable, and
+// Fresh records whether price has revisited the active zone after confirmation.
+setup15mDemand1Top = phase5SetupDemand1TopRaw
+setup15mDemand1Bottom = phase5SetupDemand1BottomRaw
+setup15mDemand1Origin = phase5SetupDemand1OriginRaw
+setup15mDemand1Confirmed = phase5SetupDemand1ConfirmedRaw
+setup15mDemand1Fresh = phase5SetupDemand1FreshRaw
+setup15mDemand1Born = setup15mDemand1Origin
+setup15mDemand2Top = phase5SetupDemand2TopRaw
+setup15mDemand2Bottom = phase5SetupDemand2BottomRaw
+setup15mDemand2Origin = phase5SetupDemand2OriginRaw
+setup15mDemand2Confirmed = phase5SetupDemand2ConfirmedRaw
+setup15mDemand2Fresh = phase5SetupDemand2FreshRaw
+setup15mDemand2Born = setup15mDemand2Origin
+setup15mDemand3Top = phase5SetupDemand3TopRaw
+setup15mDemand3Bottom = phase5SetupDemand3BottomRaw
+setup15mDemand3Origin = phase5SetupDemand3OriginRaw
+setup15mDemand3Confirmed = phase5SetupDemand3ConfirmedRaw
+setup15mDemand3Fresh = phase5SetupDemand3FreshRaw
+setup15mDemand3Born = setup15mDemand3Origin
+
+setup15mSupply1Top = phase5SetupSupply1TopRaw
+setup15mSupply1Bottom = phase5SetupSupply1BottomRaw
+setup15mSupply1Origin = phase5SetupSupply1OriginRaw
+setup15mSupply1Confirmed = phase5SetupSupply1ConfirmedRaw
+setup15mSupply1Fresh = phase5SetupSupply1FreshRaw
+setup15mSupply1Born = setup15mSupply1Origin
+setup15mSupply2Top = phase5SetupSupply2TopRaw
+setup15mSupply2Bottom = phase5SetupSupply2BottomRaw
+setup15mSupply2Origin = phase5SetupSupply2OriginRaw
+setup15mSupply2Confirmed = phase5SetupSupply2ConfirmedRaw
+setup15mSupply2Fresh = phase5SetupSupply2FreshRaw
+setup15mSupply2Born = setup15mSupply2Origin
+setup15mSupply3Top = phase5SetupSupply3TopRaw
+setup15mSupply3Bottom = phase5SetupSupply3BottomRaw
+setup15mSupply3Origin = phase5SetupSupply3OriginRaw
+setup15mSupply3Confirmed = phase5SetupSupply3ConfirmedRaw
+setup15mSupply3Fresh = phase5SetupSupply3FreshRaw
+setup15mSupply3Born = setup15mSupply3Origin
+
+setup15mBullOB1Top = phase5SetupBullOB1TopRaw
+setup15mBullOB1Bottom = phase5SetupBullOB1BottomRaw
+setup15mBullOB1Origin = phase5SetupBullOB1OriginRaw
+setup15mBullOB1Confirmed = phase5SetupBullOB1ConfirmedRaw
+setup15mBullOB1Fresh = phase5SetupBullOB1FreshRaw
+setup15mBullOB1Born = setup15mBullOB1Origin
+setup15mBullOB2Top = phase5SetupBullOB2TopRaw
+setup15mBullOB2Bottom = phase5SetupBullOB2BottomRaw
+setup15mBullOB2Origin = phase5SetupBullOB2OriginRaw
+setup15mBullOB2Confirmed = phase5SetupBullOB2ConfirmedRaw
+setup15mBullOB2Fresh = phase5SetupBullOB2FreshRaw
+setup15mBullOB2Born = setup15mBullOB2Origin
+setup15mBullOB3Top = phase5SetupBullOB3TopRaw
+setup15mBullOB3Bottom = phase5SetupBullOB3BottomRaw
+setup15mBullOB3Origin = phase5SetupBullOB3OriginRaw
+setup15mBullOB3Confirmed = phase5SetupBullOB3ConfirmedRaw
+setup15mBullOB3Fresh = phase5SetupBullOB3FreshRaw
+setup15mBullOB3Born = setup15mBullOB3Origin
+
+setup15mBearOB1Top = phase5SetupBearOB1TopRaw
+setup15mBearOB1Bottom = phase5SetupBearOB1BottomRaw
+setup15mBearOB1Origin = phase5SetupBearOB1OriginRaw
+setup15mBearOB1Confirmed = phase5SetupBearOB1ConfirmedRaw
+setup15mBearOB1Fresh = phase5SetupBearOB1FreshRaw
+setup15mBearOB1Born = setup15mBearOB1Origin
+setup15mBearOB2Top = phase5SetupBearOB2TopRaw
+setup15mBearOB2Bottom = phase5SetupBearOB2BottomRaw
+setup15mBearOB2Origin = phase5SetupBearOB2OriginRaw
+setup15mBearOB2Confirmed = phase5SetupBearOB2ConfirmedRaw
+setup15mBearOB2Fresh = phase5SetupBearOB2FreshRaw
+setup15mBearOB2Born = setup15mBearOB2Origin
+setup15mBearOB3Top = phase5SetupBearOB3TopRaw
+setup15mBearOB3Bottom = phase5SetupBearOB3BottomRaw
+setup15mBearOB3Origin = phase5SetupBearOB3OriginRaw
+setup15mBearOB3Confirmed = phase5SetupBearOB3ConfirmedRaw
+setup15mBearOB3Fresh = phase5SetupBearOB3FreshRaw
+setup15mBearOB3Born = setup15mBearOB3Origin
+
+setup15mBullFVG1Top = phase5SetupBullFVG1TopRaw
+setup15mBullFVG1Bottom = phase5SetupBullFVG1BottomRaw
+setup15mBullFVG1Origin = int(na)
+setup15mBullFVG1Confirmed = int(na)
+setup15mBullFVG1Fresh = phase5SetupBullFVG1FreshRaw
+setup15mBullFVG1Born = setup15mBullFVG1Origin
+setup15mBullFVG2Top = phase5SetupBullFVG2TopRaw
+setup15mBullFVG2Bottom = phase5SetupBullFVG2BottomRaw
+setup15mBullFVG2Origin = int(na)
+setup15mBullFVG2Confirmed = int(na)
+setup15mBullFVG2Fresh = phase5SetupBullFVG2FreshRaw
+setup15mBullFVG2Born = setup15mBullFVG2Origin
+setup15mBullFVG3Top = phase5SetupBullFVG3TopRaw
+setup15mBullFVG3Bottom = phase5SetupBullFVG3BottomRaw
+setup15mBullFVG3Origin = int(na)
+setup15mBullFVG3Confirmed = int(na)
+setup15mBullFVG3Fresh = phase5SetupBullFVG3FreshRaw
+setup15mBullFVG3Born = setup15mBullFVG3Origin
+
+setup15mBearFVG1Top = phase5SetupBearFVG1TopRaw
+setup15mBearFVG1Bottom = phase5SetupBearFVG1BottomRaw
+setup15mBearFVG1Origin = int(na)
+setup15mBearFVG1Confirmed = int(na)
+setup15mBearFVG1Fresh = phase5SetupBearFVG1FreshRaw
+setup15mBearFVG1Born = setup15mBearFVG1Origin
+setup15mBearFVG2Top = phase5SetupBearFVG2TopRaw
+setup15mBearFVG2Bottom = phase5SetupBearFVG2BottomRaw
+setup15mBearFVG2Origin = int(na)
+setup15mBearFVG2Confirmed = int(na)
+setup15mBearFVG2Fresh = phase5SetupBearFVG2FreshRaw
+setup15mBearFVG2Born = setup15mBearFVG2Origin
+setup15mBearFVG3Top = phase5SetupBearFVG3TopRaw
+setup15mBearFVG3Bottom = phase5SetupBearFVG3BottomRaw
+setup15mBearFVG3Origin = int(na)
+setup15mBearFVG3Confirmed = int(na)
+setup15mBearFVG3Fresh = phase5SetupBearFVG3FreshRaw
+setup15mBearFVG3Born = setup15mBearFVG3Origin
+
+setup15mPivotSupport1Top = phase5SetupPivotSupport1TopRaw
+setup15mPivotSupport1Bottom = phase5SetupPivotSupport1BottomRaw
+setup15mPivotSupport1Origin = phase5SetupPivotSupport1OriginRaw
+setup15mPivotSupport1Confirmed = phase5SetupPivotSupport1ConfirmedRaw
+setup15mPivotSupport1Fresh = phase5SetupPivotSupport1FreshRaw
+setup15mPivotSupport1Born = setup15mPivotSupport1Origin
+setup15mPivotSupport2Top = phase5SetupPivotSupport2TopRaw
+setup15mPivotSupport2Bottom = phase5SetupPivotSupport2BottomRaw
+setup15mPivotSupport2Origin = phase5SetupPivotSupport2OriginRaw
+setup15mPivotSupport2Confirmed = phase5SetupPivotSupport2ConfirmedRaw
+setup15mPivotSupport2Fresh = phase5SetupPivotSupport2FreshRaw
+setup15mPivotSupport2Born = setup15mPivotSupport2Origin
+setup15mPivotSupport3Top = phase5SetupPivotSupport3TopRaw
+setup15mPivotSupport3Bottom = phase5SetupPivotSupport3BottomRaw
+setup15mPivotSupport3Origin = phase5SetupPivotSupport3OriginRaw
+setup15mPivotSupport3Confirmed = phase5SetupPivotSupport3ConfirmedRaw
+setup15mPivotSupport3Fresh = phase5SetupPivotSupport3FreshRaw
+setup15mPivotSupport3Born = setup15mPivotSupport3Origin
+
+setup15mPivotResistance1Top = phase5SetupPivotResistance1TopRaw
+setup15mPivotResistance1Bottom = phase5SetupPivotResistance1BottomRaw
+setup15mPivotResistance1Origin = phase5SetupPivotResistance1OriginRaw
+setup15mPivotResistance1Confirmed = phase5SetupPivotResistance1ConfirmedRaw
+setup15mPivotResistance1Fresh = phase5SetupPivotResistance1FreshRaw
+setup15mPivotResistance1Born = setup15mPivotResistance1Origin
+setup15mPivotResistance2Top = phase5SetupPivotResistance2TopRaw
+setup15mPivotResistance2Bottom = phase5SetupPivotResistance2BottomRaw
+setup15mPivotResistance2Origin = phase5SetupPivotResistance2OriginRaw
+setup15mPivotResistance2Confirmed = phase5SetupPivotResistance2ConfirmedRaw
+setup15mPivotResistance2Fresh = phase5SetupPivotResistance2FreshRaw
+setup15mPivotResistance2Born = setup15mPivotResistance2Origin
+setup15mPivotResistance3Top = phase5SetupPivotResistance3TopRaw
+setup15mPivotResistance3Bottom = phase5SetupPivotResistance3BottomRaw
+setup15mPivotResistance3Origin = phase5SetupPivotResistance3OriginRaw
+setup15mPivotResistance3Confirmed = phase5SetupPivotResistance3ConfirmedRaw
+setup15mPivotResistance3Fresh = phase5SetupPivotResistance3FreshRaw
+setup15mPivotResistance3Born = setup15mPivotResistance3Origin
+
+// Compatibility aliases keep the original nearest-candidate Phase 5 contract.
+setup15mDemandTop = setup15mDemand1Top
+setup15mDemandBottom = setup15mDemand1Bottom
+setup15mSupplyTop = setup15mSupply1Top
+setup15mSupplyBottom = setup15mSupply1Bottom
+setup15mBullOBTop = setup15mBullOB1Top
+setup15mBullOBBottom = setup15mBullOB1Bottom
+setup15mBearOBTop = setup15mBearOB1Top
+setup15mBearOBBottom = setup15mBearOB1Bottom
+setup15mBullFVGTop = setup15mBullFVG1Top
+setup15mBullFVGBottom = setup15mBullFVG1Bottom
+setup15mBearFVGTop = setup15mBearFVG1Top
+setup15mBearFVGBottom = setup15mBearFVG1Bottom
+setup15mPivotSupportTop = setup15mPivotSupport1Top
+setup15mPivotSupportBottom = setup15mPivotSupport1Bottom
+setup15mPivotResistanceTop = setup15mPivotResistance1Top
+setup15mPivotResistanceBottom = setup15mPivotResistance1Bottom
+
+setup15mDemand = setup15mDemandTop
+setup15mSupply = setup15mSupplyBottom
+setup15mBullOB = setup15mBullOBTop
+setup15mBearOB = setup15mBearOBBottom
+setup15mBullFVG = math.avg(setup15mBullFVGTop, setup15mBullFVGBottom)
+setup15mBearFVG = math.avg(setup15mBearFVGTop, setup15mBearFVGBottom)
+setup15mPivotSupport = setup15mPivotSupportTop
+setup15mPivotResistance = setup15mPivotResistanceBottom
+setup15mEQH1 = phase5SetupEQH1Raw
+setup15mEQH1Origin = int(na)
+setup15mEQH1Confirmed = int(na)
+setup15mEQH2 = phase5SetupEQH2Raw
+setup15mEQH2Origin = int(na)
+setup15mEQH2Confirmed = int(na)
+setup15mEQH3 = phase5SetupEQH3Raw
+setup15mEQH3Origin = int(na)
+setup15mEQH3Confirmed = int(na)
+setup15mEQL1 = phase5SetupEQL1Raw
+setup15mEQL1Origin = int(na)
+setup15mEQL1Confirmed = int(na)
+setup15mEQL2 = phase5SetupEQL2Raw
+setup15mEQL2Origin = int(na)
+setup15mEQL2Confirmed = int(na)
+setup15mEQL3 = phase5SetupEQL3Raw
+setup15mEQL3Origin = int(na)
+setup15mEQL3Confirmed = int(na)
+setup15mEQH = setup15mEQH1
+setup15mEQL = setup15mEQL1
+setup15mLocation = phase5SetupLocationRaw
+setup15mSwingHigh = phase5SetupSwingHighRaw
+setup15mSwingLow = phase5SetupSwingLowRaw
+
+exec5mInternalTrend = phase5ExecInternalTrendConfirmed
+exec5mSwingTrend = phase5ExecSwingTrendConfirmed
+exec5mTrend = exec5mInternalTrend
+exec5mInternalBullCHoCH = phase5ExecInternalBullChochConfirmed
+exec5mInternalBearCHoCH = phase5ExecInternalBearChochConfirmed
+exec5mInternalBullBreak = phase5ExecInternalBullBreakConfirmed
+exec5mInternalBearBreak = phase5ExecInternalBearBreakConfirmed
+exec5mSwingBullCHoCH = phase5ExecSwingBullChochConfirmed
+exec5mSwingBearCHoCH = phase5ExecSwingBearChochConfirmed
+exec5mBullCHoCH = phase5ExecBullChochConfirmed
+exec5mBearCHoCH = phase5ExecBearChochConfirmed
+exec5mATR = phase5ExecAtrConfirmed
+
+exec5mInternalTrendLive = phase5ExecInternalTrendLive
+exec5mSwingTrendLive = phase5ExecSwingTrendLive
+exec5mTrendLive = exec5mInternalTrendLive
+exec5mInternalBullCHoCHLive = phase5ExecInternalBullChochLive
+exec5mInternalBearCHoCHLive = phase5ExecInternalBearChochLive
+exec5mSwingBullCHoCHLive = phase5ExecSwingBullChochLive
+exec5mSwingBearCHoCHLive = phase5ExecSwingBearChochLive
+exec5mBullCHoCHLive = phase5ExecBullChochLive
+exec5mBearCHoCHLive = phase5ExecBearChochLive
+exec5mATRLive = phase5ExecAtrLive
+
+// =============================================================================
+// ENGINE 6 — TREND-ALIGNED STRUCTURE TRIGGER
+// A setup exists on the confirmed 5m bar that breaks an internal swing (internal
+// CHoCH or continuation BOS) in the direction of BOTH the 4H and the 1H bias,
+// while the 5m Supertrend(10, 3) agrees: the end of a pullback inside an
+// established trend, with the short-term trend already turned back.
+// V7.4 added the Supertrend check (TradingView built-in ta.supertrend,
+// non-repainting): win rate 49.4% -> 52.4%, PF 1.45 -> 1.65.
+// V7.5 added two regime/quality checks, both measured on 2024-01..2026-10:
+//   * Fast pullback: the break comes at most 11 bars after the broken internal
+//     pivot. A trend that resumes quickly continues; slow, drawn-out pullbacks
+//     (12+ bars) won only 42.5%. Thresholds 9-14 all improve the result.
+//   * Calm 1H: Choppiness Index(14) of the last completed 1H bar below 50
+//     (E.W. Dreiss). Setups in a choppy 1H regime (>= 49) won 43.7%.
+//   Together: 52.4% -> 60.4% win rate, PF 1.65 -> 2.29, max DD 8.5R -> 4.3R,
+//   0.56 -> 0.33 trades per day; in-sample 60.1%, out-of-sample 60.9%.
+// V7.2 removed the former AOI score/lock/touch/confirm pipeline. Measured on
+// XAUUSD 5m 2024-01..2026-10: first touches of every Phase-5 zone family held
+// only 34–44% of the time at 1.5R (a level with no edge ≈ 40%), on 15m, 1H and
+// 4H zones alike, and requiring an AOI touch made the trend trigger worse.
+// The Phase-5 zones are still used below, as obstacles and TP2 caps.
+// -----------------------------------------------------------------------------
+phase6CanAdvance = barstate.isconfirmed and phase5ExecutionTfOk and phase5TfHierarchyOk
+
+// Bar index of the internal (5-bar) swing pivots, so the stop can sit beyond the
+// protected extreme of the leg that was just broken.
+var int phase6InternalTopBar = na
+var int phase6InternalBottomBar = na
+if itop != 0
+    phase6InternalTopBar := bar_index - 5
+if ibtm != 0
+    phase6InternalBottomBar := bar_index - 5
+
+phase6UseSupertrend = input.bool(true, 'Require 5m Supertrend agreement', group='Engine 6 — Trigger', tooltip='Short-term trend confirmation: trade only when the 5m Supertrend points the same way as the trade.')
+phase6StFactor = input.float(3.0, 'Supertrend factor', minval=0.5, step=0.5, group='Engine 6 — Trigger')
+phase6StPeriod = input.int(10, 'Supertrend ATR period', minval=1, group='Engine 6 — Trigger')
+[phase6StLine, phase6StDirection] = ta.supertrend(phase6StFactor, phase6StPeriod)
+// ta.supertrend direction is negative while the trend is up.
+phase6StTrend = phase6StDirection < 0 ? 1 : -1
+
+phase6UseFastPullback = input.bool(true, 'Require fast pullback', group='Engine 6 — Trigger', tooltip='Trade only when the break comes within the set number of 5m bars after the broken internal swing pivot: a quick pullback that resumes the trend. Backtest 2024-01..2026-10: breaks 12+ bars after the pivot won 42.5%.')
+phase6MaxPullbackBars = input.int(11, 'Max bars from broken pivot to break', minval=6, maxval=200, group='Engine 6 — Trigger')
+phase6UseCalm1H = input.bool(true, 'Require calm 1H (Choppiness Index)', group='Engine 6 — Trigger', tooltip='Choppiness Index (E.W. Dreiss) of the last completed 1H bar must be below the maximum. High values mean a sideways, two-way market where trend breaks fail more often (43.7% win rate when >= 49). OFF: more trades (about 0.44/day), 57.7% win rate.')
+phase6ChopLength = input.int(14, '1H Choppiness length', minval=2, group='Engine 6 — Trigger')
+phase6ChopMax = input.float(50.0, '1H Choppiness maximum', minval=0.0, maxval=100.0, step=1.0, group='Engine 6 — Trigger')
+
+// Last completed 1H bar only ([1] with lookahead on): no repainting.
+phase6_chop_packet(_length) =>
+    _range = ta.highest(high, _length) - ta.lowest(low, _length)
+    _chop = _range > 0 ? 100 * math.log10(math.sum(ta.tr(true), _length) / _range) / math.log10(_length) : na
+    _chop[1]
+phase6Chop1H = request.security(syminfo.tickerid, phase5BiasTf, phase6_chop_packet(phase6ChopLength), lookahead=barmerge.lookahead_on)
+phase6RegimeOk = not phase6UseCalm1H or (not na(phase6Chop1H) and phase6Chop1H < phase6ChopMax)
+phase6LongPivotAge = na(phase6InternalTopBar) ? na : bar_index - phase6InternalTopBar
+phase6ShortPivotAge = na(phase6InternalBottomBar) ? na : bar_index - phase6InternalBottomBar
+phase6LongFast = not phase6UseFastPullback or (not na(phase6LongPivotAge) and phase6LongPivotAge <= phase6MaxPullbackBars)
+phase6ShortFast = not phase6UseFastPullback or (not na(phase6ShortPivotAge) and phase6ShortPivotAge <= phase6MaxPullbackBars)
+
+phase6LongTrigger = phase6CanAdvance and exec5mInternalBullBreak and macro4HBias == 1 and bias1H == 1 and (not phase6UseSupertrend or phase6StTrend == 1) and phase6LongFast and phase6RegimeOk
+phase6ShortTrigger = phase6CanAdvance and exec5mInternalBearBreak and macro4HBias == -1 and bias1H == -1 and (not phase6UseSupertrend or phase6StTrend == -1) and phase6ShortFast and phase6RegimeOk
+phase6Side = phase6LongTrigger ? 1 : phase6ShortTrigger ? -1 : 0
+phase6DirectionContext = macro4HBias == 1 and bias1H == 1 ? 1 : macro4HBias == -1 and bias1H == -1 ? -1 : 0
+phase6DirectionText = phase6DirectionContext == 1 ? 'BULLISH (longs only)' : phase6DirectionContext == -1 ? 'BEARISH (shorts only)' : 'MIXED (no trades)'
+
+// Protected extreme: lowest low (long) / highest high (short) from the broken
+// internal swing pivot to the trigger bar; last 13 bars if the pivot is too old.
+float phase6ProtectedExtreme = na
+float phase6BrokenLevel = na
+if phase6Side != 0
+    int _pivotBar = phase6Side == 1 ? phase6InternalTopBar : phase6InternalBottomBar
+    int _span = not na(_pivotBar) and bar_index - _pivotBar <= 200 ? bar_index - _pivotBar + 1 : 13
+    for _offset = 0 to _span - 1
+        if phase6Side == 1
+            phase6ProtectedExtreme := na(phase6ProtectedExtreme) ? low[_offset] : math.min(phase6ProtectedExtreme, low[_offset])
+        else
+            phase6ProtectedExtreme := na(phase6ProtectedExtreme) ? high[_offset] : math.max(phase6ProtectedExtreme, high[_offset])
+    phase6BrokenLevel := phase6Side == 1 ? itop_y : ibtm_y
+
+// Bridge state: 3 on a trigger bar (handed to Engine 7), otherwise 0.
+phase6StateCode = phase6Side != 0 ? 3 : 0
+phase6ReadyForRisk = phase6StateCode == 3
+
+// =============================================================================
+// ENGINE 7 — STRUCTURAL TRADE CONSTRUCTION
+// Entry: the trigger candle close.
+// Stop: beyond the protected extreme + buffer (ATR-scaled); the trade is
+//   skipped if that stop is wider than $15 or tighter than $2.
+// TP1: 1.51R (rule: TP1 > 1.5R), only if no obstacle lies between entry and
+//   TP1 (clean room). Obstacles: 15m Pivot S/R zones, unswept 15m EQH/EQL and
+//   the 4H swing high/low. 15m Supply/Demand zones and Order Blocks are NOT
+//   obstacles: measured over 2.75 years they did not hold, and treating them
+//   as obstacles only removed good trades.
+// TP2: 2.5R, or just in front of the first obstacle beyond TP1 if that comes
+//   earlier; it must stay > TP1 + 0.25R. No room → NO TRADE.
+// =============================================================================
+phase7StopBufferATR = input.float(0.3, 'Stop buffer beyond protected extreme (ATR)', minval=0.0, step=0.05, group='Engine 7 — Construction', tooltip='Distance beyond the protected swing low/high, as a multiple of 5m ATR(89), so normal wicks do not reach the stop.')
+phase7MaxStopUSD = input.float(15.0, 'Maximum stop distance ($)', minval=1.0, maxval=15.0, step=0.5, group='Engine 7 — Construction', tooltip='Rule: SL must not exceed $15. A setup whose structural stop needs more is skipped, never tightened inside structure.')
+phase7MinStopUSD = input.float(2.0, 'Minimum stop distance ($)', minval=0.0, step=0.5, group='Engine 7 — Construction')
+phase7TP1Multiple = input.float(1.51, 'TP1 (R multiple, must be > 1.5)', minval=1.51, maxval=5.0, step=0.01, group='Engine 7 — Construction')
+phase7TP2Multiple = input.float(2.5, 'TP2 maximum (R multiple)', minval=1.75, maxval=9.5, step=0.25, group='Engine 7 — Construction')
+phase7TargetFrontATR = input.float(0.1, 'TP2 front-run before an opposing zone (ATR)', minval=0.0, step=0.05, group='Engine 7 — Construction')
+phase7RequireCleanRoom = input.bool(true, 'Require clean room to TP1 (no obstacle)', group='Engine 7 — Construction', tooltip='Obstacles: 15m Pivot S/R, unswept 15m EQH/EQL, 4H swing high/low.')
+
+phase7_reason_code(_reason) =>
+    _reason == 'VALID_TRADE' ? 1 :
+      _reason == 'INVALID_RISK' ? 7 :
+      _reason == 'SL_TOO_WIDE' ? 8 :
+      _reason == 'SL_TOO_TIGHT' ? 9 :
+      _reason == 'NO_CLEAN_ROOM' ? 10 :
+      _reason == 'NO_TP2_ROOM' ? 11 : 0
+
+// Phase 5 publishes the prior confirmed 15m snapshot; a liquidity level already
+// taken inside the current 15m window is no longer an obstacle.
+phase7_level_unswept(_price, _side) =>
+    int _snapshotClose = na(phase5SetupTime) ? na : phase5SetupTime + int(timeframe.in_seconds(phase5SetupTf) * 1000)
+    bool _swept = false
+    if not na(_price) and not na(_snapshotClose)
+        for _barOffset = 0 to 2
+            if not na(time[_barOffset]) and time[_barOffset] >= _snapshotClose and (_side == 1 ? high[_barOffset] >= _price : low[_barOffset] <= _price)
+                _swept := true
+    not na(_price) and not na(_snapshotClose) and not _swept
+
+// Nearest obstacle strictly beyond _from in the trade direction: the near edge
+// of a 15m Pivot S/R zone, an unswept 15m EQH/EQL, or the 4H swing high/low.
+phase7_nearest_opposing(_side, _from) =>
+    float _best = na
+    array<float> _zoneEdges = _side == 1 ?
+      array.from(setup15mPivotResistance1Bottom, setup15mPivotResistance2Bottom, setup15mPivotResistance3Bottom) :
+      array.from(setup15mPivotSupport1Top, setup15mPivotSupport2Top, setup15mPivotSupport3Top)
+    array<float> _liquidity = _side == 1 ?
+      array.from(setup15mEQH1, setup15mEQH2, setup15mEQH3, macro4HHigh) :
+      array.from(setup15mEQL1, setup15mEQL2, setup15mEQL3, macro4HLow)
+    for _edge in _zoneEdges
+        if not na(_edge) and (_edge - _from) * _side > 0 and (na(_best) or math.abs(_edge - _from) < math.abs(_best - _from))
+            _best := _edge
+    for _level in _liquidity
+        if not na(_level) and (_level - _from) * _side > 0 and phase7_level_unswept(_level, _side) and (na(_best) or math.abs(_level - _from) < math.abs(_best - _from))
+            _best := _level
+    _best
+
+var int phase7LastProcessedReadyTime = na
+var int phase7SetupId = na
+var int phase7Side = 0
+var string phase7EntryKind = 'NONE'
+var float phase7ImpulseA = na
+var float phase7ImpulseB = na
+var float phase7ImpulseStrength = na
+var float phase7Entry = na
+var float phase7SL = na
+var float phase7TP1 = na
+var float phase7TP2 = na
+var float phase7TP1R = na
+var float phase7TP2R = na
+var string phase7Reason = 'NO_SETUP'
+var bool phase7BridgeValid = false
+
+phase7NewReady = phase6ReadyForRisk and (na(phase7LastProcessedReadyTime) or time != phase7LastProcessedReadyTime)
+if phase7NewReady
+    phase7LastProcessedReadyTime := time
+    phase7SetupId := na
+    phase7Side := phase6Side
+    phase7EntryKind := 'NONE'
+    phase7ImpulseA := phase6ProtectedExtreme
+    phase7ImpulseB := phase6BrokenLevel
+    phase7ImpulseStrength := not na(exec5mATR) and exec5mATR > 0 ? math.abs(phase6BrokenLevel - phase6ProtectedExtreme) / exec5mATR : na
+    phase7Entry := na
+    phase7SL := na
+    phase7TP1 := na
+    phase7TP2 := na
+    phase7TP1R := na
+    phase7TP2R := na
+    phase7BridgeValid := false
+    float _entry = close
+    float _stop = na(phase6ProtectedExtreme) or na(exec5mATR) ? na : phase6ProtectedExtreme - phase7Side * phase7StopBufferATR * exec5mATR
+    float _risk = na(_stop) ? na : (_entry - _stop) * phase7Side
+    if na(_risk) or _risk <= 0 or na(phase7ImpulseStrength) or (phase7ImpulseB - phase7ImpulseA) * phase7Side <= 0
+        phase7Reason := 'INVALID_RISK'
+    else if _risk > phase7MaxStopUSD
+        phase7Reason := 'SL_TOO_WIDE'
+    else if _risk < phase7MinStopUSD
+        phase7Reason := 'SL_TOO_TIGHT'
+    else
+        float _tp1 = _entry + phase7Side * phase7TP1Multiple * _risk
+        float _blocker = phase7_nearest_opposing(phase7Side, _entry)
+        bool _blocked = phase7RequireCleanRoom and not na(_blocker) and (_tp1 - _blocker) * phase7Side > 0
+        float _tp2Cap = _entry + phase7Side * phase7TP2Multiple * _risk
+        float _beyond = phase7_nearest_opposing(phase7Side, _tp1)
+        float _tp2 = not na(_beyond) and (_beyond - _tp2Cap) * phase7Side < 0 ? _beyond - phase7Side * phase7TargetFrontATR * exec5mATR : _tp2Cap
+        if _blocked
+            phase7Reason := 'NO_CLEAN_ROOM'
+        else if (_tp2 - _tp1) * phase7Side <= 0.25 * _risk
+            phase7Reason := 'NO_TP2_ROOM'
+        else
+            phase7SetupId := time
+            phase7EntryKind := 'READY_CLOSE'
+            phase7Entry := _entry
+            phase7SL := _stop
+            phase7TP1 := _tp1
+            phase7TP2 := _tp2
+            phase7TP1R := phase7TP1Multiple
+            phase7TP2R := (_tp2 - _entry) * phase7Side / _risk
+            phase7Reason := 'VALID_TRADE'
+            phase7BridgeValid := true
+
+phase7BridgeSideCode = phase7Side == 1 ? 1 : phase7Side == -1 ? 2 : 0
+phase7BridgeEntryCode = phase7BridgeValid ? 1 : 0
+phase7BridgeTP1Code = phase7BridgeValid ? int(math.floor(phase7TP1R * 10)) : 0
+phase7BridgeTP2Code = phase7BridgeValid ? int(math.floor(phase7TP2R * 10)) : 0
+phase7BridgeReasonCode = phase7_reason_code(phase7Reason)
+phase7BridgeMeta = 70000000000 + (phase7BridgeValid ? 10000000000 : 0) + phase7BridgeSideCode * 1000000000 + phase7BridgeEntryCode * 100000000 + phase7BridgeTP1Code * 1000000 + phase7BridgeTP2Code * 10000 + phase7BridgeReasonCode
+
+// Public split contract. Keep exactly ten hidden plots: TradingView permits a
+// consumer to select at most ten outputs from other indicators. Distinct idle
+// sentinels let the consumer verify every manually mapped channel before a
+// valid package exists, without adding plots or changing price precision.
+float phase7BridgeEvalSentinel = -710000001.0
+float phase7BridgeEntrySentinel = -710000003.0
+float phase7BridgeSLSentinel = -710000004.0
+float phase7BridgeTP1Sentinel = -710000005.0
+float phase7BridgeTP2Sentinel = -710000006.0
+float phase7BridgeImpulseASentinel = -710000008.0
+float phase7BridgeImpulseBSentinel = -710000009.0
+float phase7BridgeStrengthSentinel = -710000010.0
+
+plot(na(phase7LastProcessedReadyTime) ? phase7BridgeEvalSentinel : phase7LastProcessedReadyTime, 'BRIDGE_EVAL_ID', display=display.none)
+plot(phase7BridgeMeta, 'BRIDGE_META', display=display.none)
+plot(phase7BridgeValid ? phase7Entry : phase7BridgeEntrySentinel, 'BRIDGE_ENTRY', display=display.none)
+plot(phase7BridgeValid ? phase7SL : phase7BridgeSLSentinel, 'BRIDGE_SL', display=display.none)
+plot(phase7BridgeValid ? phase7TP1 : phase7BridgeTP1Sentinel, 'BRIDGE_TP1', display=display.none)
+plot(phase7BridgeValid ? phase7TP2 : phase7BridgeTP2Sentinel, 'BRIDGE_TP2', display=display.none)
+plot(phase6StateCode, 'BRIDGE_E6_STATE', display=display.none)
+plot(phase7BridgeValid ? phase7ImpulseA : phase7BridgeImpulseASentinel, 'BRIDGE_IMPULSE_A', display=display.none)
+plot(phase7BridgeValid ? phase7ImpulseB : phase7BridgeImpulseBSentinel, 'BRIDGE_IMPULSE_B', display=display.none)
+plot(phase7BridgeValid ? phase7ImpulseStrength : phase7BridgeStrengthSentinel, 'BRIDGE_IMPULSE_STRENGTH', display=display.none)
+
+// =============================================================================
+// DECISION LEVELS ON THE CHART
+// Draws exactly what the trade logic uses, so chart reading matches the logic:
+// the 5m Supertrend, and the current clean-room obstacles (15m Pivot S/R zones,
+// unswept 15m EQH/EQL, 4H swing high/low). Only levels within reach of a trade
+// are drawn: TP2 is at most 2.5R with R at most $15, so a level farther than
+// that from price can never block TP1 or cap TP2. Plotted after the ten bridge
+// plots, so the Execution input mapping (plots 0-9) is unchanged.
+// =============================================================================
+phase6ShowLevels = input.bool(false, 'Show decision levels (Supertrend + obstacles)', group='Engine 6 — Trigger')
+plot(phase6ShowLevels and phase6UseSupertrend ? phase6StLine : na, 'Supertrend 5m', color=phase6StTrend == 1 ? color.new(color.teal, 10) : color.new(color.red, 10), linewidth=1, style=plot.style_linebr)
+phase6LevelReach = phase7TP2Multiple * phase7MaxStopUSD
+var array<box> phase6LevelBoxes = array.new<box>()
+var array<line> phase6LevelLines = array.new<line>()
+var array<label> phase6LevelLabels = array.new<label>()
+phase6_level_box(_top, _bottom, _color, _text) =>
+    if not na(_top) and not na(_bottom) and (close >= _bottom and close <= _top or math.min(math.abs(_top - close), math.abs(_bottom - close)) <= phase6LevelReach)
+        array.push(phase6LevelBoxes, box.new(bar_index - 60, _top, bar_index + 8, _bottom, border_color=color.new(_color, 40), bgcolor=color.new(_color, 85), text=_text, text_color=color.new(_color, 0), text_size=size.tiny, text_halign=text.align_right))
+phase6_level_line(_price, _color, _text, _style) =>
+    if not na(_price) and math.abs(_price - close) <= phase6LevelReach
+        array.push(phase6LevelLines, line.new(bar_index - 60, _price, bar_index + 8, _price, color=color.new(_color, 20), style=_style, width=1))
+        array.push(phase6LevelLabels, label.new(bar_index + 8, _price, _text, style=label.style_label_left, color=color.new(_color, 70), textcolor=color.white, size=size.tiny))
+if barstate.islast
+    for _b in phase6LevelBoxes
+        box.delete(_b)
+    for _l in phase6LevelLines
+        line.delete(_l)
+    for _t in phase6LevelLabels
+        label.delete(_t)
+    array.clear(phase6LevelBoxes)
+    array.clear(phase6LevelLines)
+    array.clear(phase6LevelLabels)
+    if phase6ShowLevels
+        phase6_level_box(setup15mPivotResistance1Top, setup15mPivotResistance1Bottom, color.red, '15m pivot R')
+        phase6_level_box(setup15mPivotResistance2Top, setup15mPivotResistance2Bottom, color.red, '15m pivot R')
+        phase6_level_box(setup15mPivotResistance3Top, setup15mPivotResistance3Bottom, color.red, '15m pivot R')
+        phase6_level_box(setup15mPivotSupport1Top, setup15mPivotSupport1Bottom, color.green, '15m pivot S')
+        phase6_level_box(setup15mPivotSupport2Top, setup15mPivotSupport2Bottom, color.green, '15m pivot S')
+        phase6_level_box(setup15mPivotSupport3Top, setup15mPivotSupport3Bottom, color.green, '15m pivot S')
+        // Liquidity is drawn only while it can still block a trade: unswept and
+        // ahead of price (the same test Engine 7 applies).
+        for _eqh in array.from(setup15mEQH1, setup15mEQH2, setup15mEQH3)
+            phase6_level_line(not na(_eqh) and _eqh > close and phase7_level_unswept(_eqh, 1) ? _eqh : na, color.orange, 'EQH', line.style_dotted)
+        for _eql in array.from(setup15mEQL1, setup15mEQL2, setup15mEQL3)
+            phase6_level_line(not na(_eql) and _eql < close and phase7_level_unswept(_eql, -1) ? _eql : na, color.aqua, 'EQL', line.style_dotted)
+        phase6_level_line(not na(macro4HHigh) and macro4HHigh > close and phase7_level_unswept(macro4HHigh, 1) ? macro4HHigh : na, color.fuchsia, '4H swing high', line.style_dashed)
+        phase6_level_line(not na(macro4HLow) and macro4HLow < close and phase7_level_unswept(macro4HLow, -1) ? macro4HLow : na, color.fuchsia, '4H swing low', line.style_dashed)
+
+phase5_bias_text(_state) =>
+    _state == 1 ? 'Bullish' : _state == -1 ? 'Bearish' : 'Neutral'
+
+phase5_direction_text(_state) =>
+    _state == 1 ? 'Bullish break' : _state == -1 ? 'Bearish break' : 'No new break'
+
+phase5_location_text(_state) =>
+    _state == 1 ? 'Premium' : _state == -1 ? 'Discount' : _state == 0 ? 'Equilibrium' :
+      _state == 2 ? 'Above equilibrium' : _state == -2 ? 'Below equilibrium' : 'Unavailable'
+
+phase5_price_text(_price) =>
+    na(_price) ? '—' : str.tostring(_price, format.mintick)
+
+phase5_zone_text(_top, _bottom) =>
+    na(_top) or na(_bottom) ? '—' : phase5_price_text(_bottom) + '–' + phase5_price_text(_top)
+
+phase5_candidate_count(_top1, _top2, _top3) =>
+    (not na(_top1) ? 1 : 0) + (not na(_top2) ? 1 : 0) + (not na(_top3) ? 1 : 0)
+
+phase5_state_color(_state) =>
+    _state == 1 ? color.new(color.lime, 70) : _state == -1 ? color.new(color.red, 70) : color.new(color.gray, 75)
+
+phase5DebugOn = input.bool(false, 'Show MTF Debug Table', group='Phase 5 — Debug')
+phase5DebugPosition = input.string(position.top_right, 'Table position', options=[position.top_right, position.top_left, position.bottom_right, position.bottom_left], group='Phase 5 — Debug')
+var table phase5DebugTable = table.new(phase5DebugPosition, 2, 40, border_width=1)
+
+phase5_debug_row(_row, _name, _value, _background) =>
+    table.cell(phase5DebugTable, 0, _row, _name, text_color=color.white, bgcolor=color.new(color.black, 15), text_size=size.tiny)
+    table.cell(phase5DebugTable, 1, _row, _value, text_color=color.white, bgcolor=_background, text_size=size.tiny)
+
+if barstate.islast
+    if phase5DebugOn
+        table.cell(phase5DebugTable, 0, 0, 'PHASE 5 + ENGINE 6 BRAIN', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.tiny)
+        table.cell(phase5DebugTable, 1, 0, phase5ExecutionTfOk and phase5TfHierarchyOk ? '5m chart OK' : 'Use locked 5m chart', text_color=color.white, bgcolor=phase5ExecutionTfOk and phase5TfHierarchyOk ? color.new(color.green, 55) : color.new(color.orange, 35), text_size=size.tiny)
+        phase5_debug_row(1, '4H macro bias', phase5_bias_text(macro4HBias), phase5_state_color(macro4HBias))
+        phase5_debug_row(2, '4H high / low', phase5_price_text(macro4HHigh) + ' / ' + phase5_price_text(macro4HLow), color.new(color.gray, 75))
+        phase5_debug_row(3, '4H latest break', phase5_direction_text(macro4HBreak), phase5_state_color(macro4HBreak))
+        phase5_debug_row(4, '1H primary bias', phase5_bias_text(bias1H), phase5_state_color(bias1H))
+        phase5_debug_row(5, '1H confirmed swing location', phase5_location_text(bias1HLocation), color.new(color.gray, 75))
+        phase5_debug_row(6, 'Previous D high / low', phase5_price_text(prevDayHigh) + ' / ' + phase5_price_text(prevDayLow), color.new(color.gray, 75))
+        phase5_debug_row(7, 'Previous W high / low', phase5_price_text(prevWeekHigh) + ' / ' + phase5_price_text(prevWeekLow), color.new(color.gray, 75))
+        phase5_debug_row(8, 'Previous M high / low', phase5_price_text(prevMonthHigh) + ' / ' + phase5_price_text(prevMonthLow), color.new(color.gray, 75))
+        phase5_debug_row(9, '15m demand / supply', phase5_zone_text(setup15mDemandTop, setup15mDemandBottom) + ' / ' + phase5_zone_text(setup15mSupplyTop, setup15mSupplyBottom), color.new(color.gray, 75))
+        phase5_debug_row(10, '15m bull / bear OB', phase5_zone_text(setup15mBullOBTop, setup15mBullOBBottom) + ' / ' + phase5_zone_text(setup15mBearOBTop, setup15mBearOBBottom), color.new(color.gray, 75))
+        phase5_debug_row(11, '15m bull / bear FVG', phase5_zone_text(setup15mBullFVGTop, setup15mBullFVGBottom) + ' / ' + phase5_zone_text(setup15mBearFVGTop, setup15mBearFVGBottom), color.new(color.gray, 75))
+        phase5_debug_row(12, '15m pivot S / R', phase5_zone_text(setup15mPivotSupportTop, setup15mPivotSupportBottom) + ' / ' + phase5_zone_text(setup15mPivotResistanceTop, setup15mPivotResistanceBottom), color.new(color.gray, 75))
+        phase5_debug_row(13, '15m pool D/S BO/SO BF/SF PS/PR', str.tostring(phase5_candidate_count(setup15mDemand1Top, setup15mDemand2Top, setup15mDemand3Top)) + '/' + str.tostring(phase5_candidate_count(setup15mSupply1Top, setup15mSupply2Top, setup15mSupply3Top)) + ' ' + str.tostring(phase5_candidate_count(setup15mBullOB1Top, setup15mBullOB2Top, setup15mBullOB3Top)) + '/' + str.tostring(phase5_candidate_count(setup15mBearOB1Top, setup15mBearOB2Top, setup15mBearOB3Top)) + ' ' + str.tostring(phase5_candidate_count(setup15mBullFVG1Top, setup15mBullFVG2Top, setup15mBullFVG3Top)) + '/' + str.tostring(phase5_candidate_count(setup15mBearFVG1Top, setup15mBearFVG2Top, setup15mBearFVG3Top)) + ' ' + str.tostring(phase5_candidate_count(setup15mPivotSupport1Top, setup15mPivotSupport2Top, setup15mPivotSupport3Top)) + '/' + str.tostring(phase5_candidate_count(setup15mPivotResistance1Top, setup15mPivotResistance2Top, setup15mPivotResistance3Top)), color.new(color.gray, 75))
+        phase5_debug_row(14, '15m EQH / EQL', phase5_price_text(setup15mEQH) + ' / ' + phase5_price_text(setup15mEQL), color.new(color.gray, 75))
+        phase5_debug_row(15, '15m EQH / EQL pools', str.tostring(phase5_candidate_count(setup15mEQH1, setup15mEQH2, setup15mEQH3)) + ' / ' + str.tostring(phase5_candidate_count(setup15mEQL1, setup15mEQL2, setup15mEQL3)), color.new(color.gray, 75))
+        phase5_debug_row(16, '15m confirmed swing high / low', phase5_price_text(setup15mSwingHigh) + ' / ' + phase5_price_text(setup15mSwingLow), color.new(color.gray, 75))
+        phase5_debug_row(17, '15m confirmed swing location', phase5_location_text(setup15mLocation), color.new(color.gray, 75))
+        phase5_debug_row(18, '5m internal / swing trend', phase5_bias_text(exec5mInternalTrend) + ' / ' + phase5_bias_text(exec5mSwingTrend), color.new(color.gray, 75))
+        phase5_debug_row(19, '5m internal CHoCH B/S', str.tostring(exec5mInternalBullCHoCH) + ' / ' + str.tostring(exec5mInternalBearCHoCH), color.new(color.gray, 75))
+        phase5_debug_row(20, '5m swing CHoCH B/S', str.tostring(exec5mSwingBullCHoCH) + ' / ' + str.tostring(exec5mSwingBearCHoCH), color.new(color.gray, 75))
+        phase5_debug_row(21, '5m internal break B/S', str.tostring(exec5mInternalBullBreak) + ' / ' + str.tostring(exec5mInternalBearBreak), color.new(color.gray, 75))
+        phase5_debug_row(22, '5m Supertrend (' + str.tostring(phase6StPeriod) + ', ' + str.tostring(phase6StFactor, '#.#') + ')', (phase6StTrend == 1 ? 'UP ' : 'DOWN ') + phase5_price_text(phase6StLine) + (phase6UseSupertrend ? '' : ' (filter OFF)'), phase5_state_color(phase6StTrend))
+        phase5_debug_row(23, 'Trade side allowed now', phase6DirectionContext == 0 ? 'none (4H/1H mixed)' : phase6UseSupertrend and phase6StTrend != phase6DirectionContext ? 'none (Supertrend against)' : not phase6RegimeOk ? 'none (1H choppy)' : (phase6DirectionContext == 1 ? 'LONG' : 'SHORT') + (phase6UseFastPullback ? ' (fast break only)' : ''), phase5_state_color(phase6DirectionContext == 0 or (phase6UseSupertrend and phase6StTrend != phase6DirectionContext) or not phase6RegimeOk ? 0 : phase6DirectionContext))
+        phase5_debug_row(24, 'Bars since pivot L / S (max ' + str.tostring(phase6MaxPullbackBars) + ')', (na(phase6LongPivotAge) ? '—' : str.tostring(phase6LongPivotAge)) + ' / ' + (na(phase6ShortPivotAge) ? '—' : str.tostring(phase6ShortPivotAge)) + (phase6UseFastPullback ? '' : ' (rule OFF)'), color.new(color.gray, 75))
+        phase5_debug_row(25, '1H Choppiness (max ' + str.tostring(phase6ChopMax, '#') + ')', (na(phase6Chop1H) ? '—' : str.tostring(phase6Chop1H, '#.0')) + (phase6RegimeOk ? ' calm' : ' choppy') + (phase6UseCalm1H ? '' : ' (rule OFF)'), phase6RegimeOk ? color.new(color.green, 70) : color.new(color.orange, 55))
+        phase5_debug_row(26, '5m ATR(89)', phase5_price_text(exec5mATR), color.new(color.gray, 75))
+        phase5_debug_row(27, '', '', color.new(color.gray, 100))
+        phase5_debug_row(28, 'E6 direction (4H + 1H)', phase6DirectionText, phase5_state_color(phase6DirectionContext))
+        phase5_debug_row(29, 'E6 last trigger', na(phase7LastProcessedReadyTime) ? '—' : (phase7Side == 1 ? 'LONG ' : 'SHORT ') + str.format_time(phase7LastProcessedReadyTime, 'MM-dd HH:mm'), color.new(color.gray, 75))
+        phase5_debug_row(30, 'E7 last result', phase7Reason, phase7BridgeValid ? color.new(color.green, 45) : color.new(color.orange, 55))
+        phase5_debug_row(31, 'E7 protected extreme / broken', phase5_price_text(phase7ImpulseA) + ' / ' + phase5_price_text(phase7ImpulseB), color.new(color.gray, 75))
+        phase5_debug_row(32, 'E7 entry', phase5_price_text(phase7Entry), color.new(color.blue, 60))
+        phase5_debug_row(33, 'E7 SL / risk', phase5_price_text(phase7SL) + (na(phase7SL) ? '' : ' | $' + str.tostring(math.abs(phase7Entry - phase7SL), '#.##')), color.new(color.red, 60))
+        phase5_debug_row(34, 'E7 TP1 / TP2 (R)', phase5_price_text(phase7TP1) + ' / ' + phase5_price_text(phase7TP2) + (na(phase7TP2R) ? '' : ' | ' + str.tostring(phase7TP1R, '#.##') + 'R / ' + str.tostring(phase7TP2R, '#.##') + 'R'), color.new(color.teal, 60))
+        phase5_debug_row(35, 'E7 rules', 'SL ≤ $' + str.tostring(phase7MaxStopUSD, '#.#') + ' | TP1 ' + str.tostring(phase7TP1Multiple, '#.##') + 'R | clean room ' + (phase7RequireCleanRoom ? 'ON' : 'OFF'), color.new(color.gray, 75))
+        phase5_debug_row(36, '', '', color.new(color.gray, 100))
+        phase5_debug_row(37, '', '', color.new(color.gray, 100))
+        phase5_debug_row(38, '', '', color.new(color.gray, 100))
+        phase5_debug_row(39, '', '', color.new(color.gray, 100))
+    else
+        table.clear(phase5DebugTable, 0, 0, 1, 39)
+
+// =============================================================================
+// V7.5 STRATEGY TEST — ORDERS AND RESULTS (appended; the logic above is unchanged)
+// =============================================================================
+stRiskUSD = input.float(100.0, 'Risk per trade ($)', minval=1.0, step=10.0, group='Strategy test', tooltip='Position size = risk / stop distance, so net profit / risk = net R.')
+stTP1ClosePct = input.int(50, 'Close at TP1 (%)', minval=1, maxval=100, group='Strategy test', tooltip='50 = the V7.5 system (runner to TP2 with the original stop). 100 = close everything at TP1; TradingView\'s "Percent profitable" then equals the project win rate.')
+stShowTable = input.bool(true, 'Show results table', group='Strategy test')
+stTablePosition = input.string(position.middle_right, 'Results table position', options=[position.middle_right, position.top_right, position.top_left, position.bottom_right, position.bottom_left, position.middle_left], group='Strategy test')
+
+stTfOk = timeframe.period == '5'
+// A new valid Engine 7 package on its own trigger bar: the same event the Execution
+// script opens a trade on (it re-checks SL <= $15, TP1 > 1.5R and TP2 beyond TP1).
+stRiskNow = math.abs(phase7Entry - phase7SL)
+stNewPackage = stTfOk and phase7NewReady and phase7BridgeValid and stRiskNow > 0 and stRiskNow <= 15.0 + syminfo.mintick and
+  math.abs(phase7TP1 - phase7Entry) / stRiskNow > 1.5 and math.abs(phase7TP2 - phase7Entry) > math.abs(phase7TP1 - phase7Entry)
+
+var int stState = 0
+var int stSide = 0
+var float stEntry = na
+var float stSL = na
+var float stTP1 = na
+var float stTP2 = na
+var float stTP1R = na
+var float stTP2R = na
+var int stFillBar = na
+var bool stTP1Hit = false
+var int stTrades = 0
+var int stWins = 0
+var int stLosses = 0
+var int stWinsTP2 = 0
+var float stNetR = 0.0
+var float stPeakR = 0.0
+var float stMaxDDR = 0.0
+var int stDays = 0
+var int stFirstTime = na
+if na(stFirstTime)
+    stFirstTime := time
+if timeframe.change('D')
+    stDays += 1
+stPart = stTP1ClosePct / 100.0
+
+// Manage the live trade first (stop first when one candle touches both), then open.
+if stTfOk and barstate.isconfirmed and stState == 1 and bar_index > stFillBar
+    stStopNow = stSide == 1 ? low <= stSL : high >= stSL
+    stTP1Now = stSide == 1 ? high >= stTP1 : low <= stTP1
+    stTP2Now = stSide == 1 ? high >= stTP2 : low <= stTP2
+    if stStopNow or stTP2Now or (stTP1Now and stPart >= 1.0)
+        bool stIsWin = stTP1Hit or not stStopNow
+        float stR = not stIsWin ? -1.0 : stPart >= 1.0 ? stTP1R : stStopNow ? stPart * stTP1R - (1 - stPart) : stPart * stTP1R + (1 - stPart) * stTP2R
+        stWins += stIsWin ? 1 : 0
+        stLosses += stIsWin ? 0 : 1
+        stWinsTP2 += stIsWin and not stStopNow and stPart < 1.0 ? 1 : 0
+        stNetR += stR
+        stPeakR := math.max(stPeakR, stNetR)
+        stMaxDDR := math.max(stMaxDDR, stPeakR - stNetR)
+        stState := 0
+    else if stTP1Now and not stTP1Hit
+        stTP1Hit := true
+
+if stNewPackage and stState == 0 and strategy.position_size == 0
+    stSide := phase7Side
+    stEntry := phase7Entry
+    stSL := phase7SL
+    stTP1 := phase7TP1
+    stTP2 := phase7TP2
+    stTP1R := math.abs(stTP1 - stEntry) / math.abs(stEntry - stSL)
+    stTP2R := math.abs(stTP2 - stEntry) / math.abs(stEntry - stSL)
+    stFillBar := bar_index
+    stTP1Hit := false
+    stState := 1
+    stTrades += 1
+    float stQty = stRiskUSD / (math.abs(stEntry - stSL) * syminfo.pointvalue)
+    string stId = stSide == 1 ? 'V7.5 LONG' : 'V7.5 SHORT'
+    strategy.entry(stId, stSide == 1 ? strategy.long : strategy.short, qty=stQty)
+    if stTP1ClosePct < 100
+        strategy.exit('TP1', from_entry=stId, qty_percent=stTP1ClosePct, limit=stTP1, stop=stSL, comment_profit='TP1 WIN', comment_loss='SL before TP1')
+        strategy.exit('TP2', from_entry=stId, qty_percent=100, limit=stTP2, stop=stSL, comment_profit='TP2 WIN', comment_loss='SL')
+    else
+        strategy.exit('TP1', from_entry=stId, limit=stTP1, stop=stSL, comment_profit='TP1 WIN', comment_loss='SL before TP1')
+
+st_r_text(_r) =>
+    (_r >= 0 ? '+' : '') + str.tostring(_r, '#.##') + 'R'
+
+var table stTable = table.new(stTablePosition, 2, 11, border_width=1)
+st_row(_row, _name, _value, _bg) =>
+    table.cell(stTable, 0, _row, _name, text_color=color.white, bgcolor=color.new(color.black, 15), text_size=size.small)
+    table.cell(stTable, 1, _row, _value, text_color=color.white, bgcolor=_bg, text_size=size.small)
+
+// A strategy only calculates on confirmed bars: draw on the last confirmed history bar too.
+if (barstate.islast or barstate.islastconfirmedhistory) and stShowTable
+    _closed = stWins + stLosses
+    table.cell(stTable, 0, 0, 'V7.5 STRATEGY TEST', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.small)
+    table.cell(stTable, 1, 0, stTfOk ? 'your rules: TP1/TP2 = WIN, SL first = LOSS' : 'Switch chart to 5m', text_color=color.white, bgcolor=stTfOk ? color.new(color.green, 55) : color.new(color.red, 35), text_size=size.small)
+    st_row(1, 'History tested', str.format_time(stFirstTime, 'yyyy-MM-dd') + ' → ' + str.format_time(time, 'yyyy-MM-dd') + ' (' + str.tostring(stDays) + ' days)', color.new(color.gray, 75))
+    st_row(2, 'Trades (per day)', str.tostring(stTrades) + ' (' + (stDays > 0 ? str.tostring(float(stTrades) / stDays, '#.##') : '—') + ')' + (stState == 1 ? ' | 1 open' : ''), color.new(color.gray, 75))
+    st_row(3, 'Wins / losses', str.tostring(stWins) + ' / ' + str.tostring(stLosses) + ' | TP2 ' + str.tostring(stWinsTP2), color.new(color.gray, 75))
+    st_row(4, 'Win rate (TP1 before SL)', _closed > 0 ? str.tostring(100.0 * stWins / _closed, '#.#') + '%' : '—', _closed == 0 ? color.new(color.gray, 75) : color.new(color.teal, 45))
+    st_row(5, 'Net R (before costs)', st_r_text(stNetR), stNetR >= 0 ? color.new(color.green, 55) : color.new(color.red, 55))
+    st_row(6, 'Max drawdown (R)', str.tostring(stMaxDDR, '#.##') + 'R', color.new(color.gray, 75))
+    st_row(7, 'Net profit $ (after costs)', str.tostring(strategy.netprofit, '#,###.##') + ' | risk $' + str.tostring(stRiskUSD, '#'), strategy.netprofit >= 0 ? color.new(color.green, 55) : color.new(color.red, 55))
+    st_row(8, 'Profit factor $', strategy.grossloss > 0 ? str.tostring(strategy.grossprofit / strategy.grossloss, '#.##') : '—', color.new(color.gray, 75))
+    st_row(9, 'Max drawdown $', str.tostring(strategy.max_drawdown, '#,###.##'), color.new(color.gray, 75))
+    st_row(10, 'Close at TP1', str.tostring(stTP1ClosePct) + '%' + (stTP1ClosePct < 100 ? ' | runner keeps the original SL' : ''), color.new(color.gray, 75))

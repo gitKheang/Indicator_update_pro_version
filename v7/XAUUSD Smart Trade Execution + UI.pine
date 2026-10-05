@@ -1,0 +1,298 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// Engine-7 lifecycle/UI consumer paired with:
+// "XAUUSD Smart Trade Brain — Phase 5 + Engine 6 Builder".
+// It owns no Phase-5 registries or target construction. Connect all ten source
+// inputs to the identically named hidden BRIDGE_* plots from the Brain.
+//
+//@version=5
+indicator(title="XAUUSD Smart Trade Execution + UI", overlay=true, max_lines_count=50, max_labels_count=50)
+
+// =============================================================================
+// BRAIN BRIDGE — EXACTLY TEN EXTERNAL SOURCE CHANNELS
+// =============================================================================
+
+bridgeEvalIdInput = input.source(close, '1 — BRIDGE_EVAL_ID', group='Brain Bridge')
+bridgeMetaInput = input.source(close, '2 — BRIDGE_META', group='Brain Bridge')
+bridgeEntryInput = input.source(close, '3 — BRIDGE_ENTRY', group='Brain Bridge')
+bridgeSLInput = input.source(close, '4 — BRIDGE_SL', group='Brain Bridge')
+bridgeTP1Input = input.source(close, '5 — BRIDGE_TP1', group='Brain Bridge')
+bridgeTP2Input = input.source(close, '6 — BRIDGE_TP2', group='Brain Bridge')
+bridgeE6StateInput = input.source(close, '7 — BRIDGE_E6_STATE', group='Brain Bridge')
+bridgeImpulseAInput = input.source(close, '8 — BRIDGE_IMPULSE_A', group='Brain Bridge')
+bridgeImpulseBInput = input.source(close, '9 — BRIDGE_IMPULSE_B', group='Brain Bridge')
+bridgeImpulseStrengthInput = input.source(close, '10 — BRIDGE_IMPULSE_STRENGTH', group='Brain Bridge')
+
+phase7ExecutionTfOk = timeframe.period == '5'
+phase7ShowSignalUI = input.bool(true, 'Show Engine-7 signal UI', group='Engine 7 — Signal UI')
+phase7LabelOffset = input.int(3, 'Right label offset (bars)', minval=1, maxval=25, group='Engine 7 — Signal UI')
+phase7ShowDebug = input.bool(true, 'Show bridge/lifecycle debug', group='Engine 7 — Debug')
+phase7DebugPosition = input.string(position.top_right, 'Table position', options=[position.top_right, position.top_left, position.bottom_right, position.bottom_left], group='Engine 7 — Debug')
+
+// META layout (protocol v7.2): 70,000,000,000 base + valid + side + entry code
+// (1 = trigger close) + TP1 code + TP2 code (R multiple x 10, floored) + reason. Dedicated
+// price channels avoid precision loss. Distinct sentinels are published while no
+// valid package exists so all ten manually selected inputs can be verified.
+float phase7BridgeEvalSentinel = -710000001.0
+float phase7BridgeEntrySentinel = -710000003.0
+float phase7BridgeSLSentinel = -710000004.0
+float phase7BridgeTP1Sentinel = -710000005.0
+float phase7BridgeTP2Sentinel = -710000006.0
+float phase7BridgeImpulseASentinel = -710000008.0
+float phase7BridgeImpulseBSentinel = -710000009.0
+float phase7BridgeStrengthSentinel = -710000010.0
+
+phase7MetaInt = int(math.round(bridgeMetaInput))
+phase7ProtocolConnected = phase7MetaInt >= 70000000000 and phase7MetaInt < 90000000000
+phase7MetaPayload = phase7ProtocolConnected ? phase7MetaInt - 70000000000 : 0
+phase7BridgeValid = phase7ProtocolConnected and int(math.floor(phase7MetaPayload / 10000000000)) == 1
+phase7SideCode = int(math.floor((phase7MetaPayload % 10000000000) / 1000000000))
+phase7EntryCode = int(math.floor((phase7MetaPayload % 1000000000) / 100000000))
+phase7TP1Code = int(math.floor((phase7MetaPayload % 100000000) / 1000000))
+phase7TP2Code = int(math.floor((phase7MetaPayload % 1000000) / 10000))
+phase7ReasonCode = int(phase7MetaPayload % 10000)
+
+phase7EvalId = int(math.round(bridgeEvalIdInput))
+phase7E6StateCode = int(math.round(bridgeE6StateInput))
+phase7EvalIsIdle = bridgeEvalIdInput == phase7BridgeEvalSentinel
+phase7EvalIsTimestamp = not na(bridgeEvalIdInput) and phase7EvalId > 0 and phase7EvalId <= time_close and phase7EvalId % 300000 == 0
+// A persisted Brain package may remain visible after its READY bar. Consume it
+// only on that original bar so a temporary bridge outage can never open a trade
+// late, after price has already moved away from the READY close.
+phase7EvalIsCurrentBar = phase7EvalIsTimestamp and phase7EvalId == time
+phase7E6ChannelValid = not na(bridgeE6StateInput) and math.abs(bridgeE6StateInput - phase7E6StateCode) <= 0.000001 and phase7E6StateCode >= 0 and phase7E6StateCode <= 4
+
+phase7IdleChannelsValid = bridgeEntryInput == phase7BridgeEntrySentinel and bridgeSLInput == phase7BridgeSLSentinel and
+  bridgeTP1Input == phase7BridgeTP1Sentinel and bridgeTP2Input == phase7BridgeTP2Sentinel and
+  bridgeImpulseAInput == phase7BridgeImpulseASentinel and bridgeImpulseBInput == phase7BridgeImpulseBSentinel and
+  bridgeImpulseStrengthInput == phase7BridgeStrengthSentinel
+
+phase7SideValid = phase7SideCode == 1 or phase7SideCode == 2
+phase7EntryKindValid = phase7EntryCode == 1
+phase7TargetCodesValid = phase7TP1Code >= 15 and phase7TP2Code >= phase7TP1Code
+phase7PricesAvailable = not na(bridgeEntryInput) and not na(bridgeSLInput) and not na(bridgeTP1Input) and not na(bridgeTP2Input)
+phase7ImpulseAvailable = not na(bridgeImpulseAInput) and not na(bridgeImpulseBInput) and not na(bridgeImpulseStrengthInput) and bridgeImpulseStrengthInput > 0
+phase7LongOrderValid = phase7SideCode == 1 and bridgeSLInput < bridgeEntryInput and bridgeEntryInput < bridgeTP1Input and bridgeTP1Input < bridgeTP2Input and bridgeImpulseAInput < bridgeImpulseBInput
+phase7ShortOrderValid = phase7SideCode == 2 and bridgeSLInput > bridgeEntryInput and bridgeEntryInput > bridgeTP1Input and bridgeTP1Input > bridgeTP2Input and bridgeImpulseAInput > bridgeImpulseBInput
+phase7BridgeRisk = phase7PricesAvailable ? math.abs(bridgeEntryInput - bridgeSLInput) : na
+// Project rules, re-checked on the received prices: SL <= $15, TP1 > 1.5R,
+// TP2 beyond TP1.
+phase7RMultiplesValid = phase7PricesAvailable and phase7BridgeRisk > 0 and phase7BridgeRisk <= 15.0 + syminfo.mintick and
+  math.abs(bridgeTP1Input - bridgeEntryInput) / phase7BridgeRisk > 1.5 and
+  math.abs(bridgeTP2Input - bridgeEntryInput) > math.abs(bridgeTP1Input - bridgeEntryInput)
+phase7ValidChannels = phase7EvalIsTimestamp and phase7SideValid and phase7EntryKindValid and phase7TargetCodesValid and
+  phase7PricesAvailable and phase7ImpulseAvailable and phase7RMultiplesValid and (phase7LongOrderValid or phase7ShortOrderValid)
+
+phase7BridgeConnected = phase7ProtocolConnected and phase7E6ChannelValid and
+  (phase7BridgeValid ? phase7ValidChannels : phase7IdleChannelsValid and (phase7EvalIsIdle or phase7EvalIsTimestamp))
+phase7PackagePayloadValid = phase7BridgeConnected and phase7BridgeValid and phase7E6StateCode == 3
+
+phase7_reason_text(_code) =>
+    _code == 1 ? 'VALID_TRADE' :
+      _code == 7 ? 'INVALID_RISK' :
+      _code == 8 ? 'SL_TOO_WIDE (> $15)' :
+      _code == 9 ? 'SL_TOO_TIGHT' :
+      _code == 10 ? 'NO_CLEAN_ROOM (zone before TP1)' :
+      _code == 11 ? 'NO_TP2_ROOM' : 'NO_VALID_TRADE'
+
+phase7_level_color(_index, _transparency) =>
+    _index == 0 ? color.new(color.rgb(33, 150, 243), _transparency) :
+      _index == 1 ? color.new(color.rgb(244, 67, 54), _transparency) :
+      _index == 2 ? color.new(color.rgb(255, 167, 38), _transparency) : color.new(color.rgb(38, 166, 154), _transparency)
+
+phase7_r_text(_r) =>
+    (_r >= 0 ? '+' : '') + str.tostring(_r, '#.##') + 'R'
+
+phase7_delete_visual(array<line> _lines, array<label> _labels) =>
+    for _lineIndex = 0 to (array.size(_lines) == 0 ? na : array.size(_lines) - 1)
+        line.delete(array.get(_lines, _lineIndex))
+    for _labelIndex = 0 to (array.size(_labels) == 0 ? na : array.size(_labels) - 1)
+        label.delete(array.get(_labels, _labelIndex))
+    array.clear(_lines)
+    array.clear(_labels)
+
+// Lines/labels: 0 = Entry, 1 = SL, 2 = TP1, 3 = TP2.
+phase7_create_visual(array<line> _lines, array<label> _labels, _startBar, _side, _entry, _stop, _tp1, _tp1R, _tp2, _tp2R) =>
+    phase7_delete_visual(_lines, _labels)
+    array<float> _levels = array.from(_entry, _stop, _tp1, _tp2)
+    array<string> _texts = array.from(
+      '▶ ' + (_side == 1 ? 'LONG' : 'SHORT') + ' entry ' + str.tostring(_entry, format.mintick),
+      'SL ' + str.tostring(_stop, format.mintick) + ' | -1R',
+      'TP1 ' + str.tostring(_tp1, format.mintick) + ' | ' + phase7_r_text(_tp1R) + ' (50%)',
+      'TP2 ' + str.tostring(_tp2, format.mintick) + ' | ' + phase7_r_text(_tp2R))
+    for _levelIndex = 0 to 3
+        _price = array.get(_levels, _levelIndex)
+        _color = phase7_level_color(_levelIndex, 0)
+        array.push(_lines, line.new(_startBar, _price, bar_index + phase7LabelOffset, _price, xloc=xloc.bar_index, extend=extend.none, color=_color, style=line.style_solid, width=2))
+        array.push(_labels, label.new(bar_index + phase7LabelOffset, _price, array.get(_texts, _levelIndex), xloc=xloc.bar_index, style=label.style_label_left, color=_color, textcolor=color.white, size=size.small))
+
+phase7_update_visual(array<line> _lines, array<label> _labels, _endBar) =>
+    for _levelIndex = 0 to (array.size(_lines) == 0 ? na : array.size(_lines) - 1)
+        line.set_x2(array.get(_lines, _levelIndex), _endBar + phase7LabelOffset)
+        label.set_x(array.get(_labels, _levelIndex), _endBar + phase7LabelOffset)
+
+phase7_fade_visual(array<line> _lines, array<label> _labels) =>
+    for _levelIndex = 0 to (array.size(_lines) == 0 ? na : array.size(_lines) - 1)
+        _color = phase7_level_color(_levelIndex, 65)
+        line.set_color(array.get(_lines, _levelIndex), _color)
+        line.set_width(array.get(_lines, _levelIndex), 1)
+        label.set_color(array.get(_labels, _levelIndex), _color)
+
+// History 1 and History 2 keep the two most recent completed trades (faded).
+var array<line> phase7CurrentLines = array.new_line()
+var array<label> phase7CurrentLabels = array.new_label()
+var array<line> phase7History1Lines = array.new_line()
+var array<label> phase7History1Labels = array.new_label()
+var array<line> phase7History2Lines = array.new_line()
+var array<label> phase7History2Labels = array.new_label()
+
+// 0 = NO_TRADE, 1 = LIVE_TRADE. A package goes live at its trigger close.
+// Win/loss rule: reaching TP1 (or TP2) is a WIN; a stop before TP1 is a LOSS.
+// There is no break-even: at TP1 half the position is closed and the other half
+// keeps the original stop and targets TP2. If that runner is stopped later, the
+// trade is still a WIN (TP1 was reached) and it is never shown as an SL hit.
+// When one candle touches both the stop and a target the stop is taken first.
+var int phase7StateCode = 0
+var int phase7LastProcessedEvalId = na
+var int phase7SetupId = na
+var int phase7Side = 0
+var float phase7ImpulseA = na
+var float phase7ImpulseB = na
+var float phase7ImpulseStrength = na
+var float phase7Entry = na
+var float phase7SL = na
+var float phase7TP1 = na
+var float phase7TP2 = na
+var float phase7TP1R = na
+var float phase7TP2R = na
+var int phase7FillBarIndex = na
+var bool phase7TP1Hit = false
+var string phase7Reason = 'NO_SETUP'
+var string phase7LastStatus = 'NO_TRADE'
+var string phase7LastEvent = 'NONE'
+var int phase7Wins = 0
+var int phase7Losses = 0
+var int phase7WinsTP2 = 0
+var float phase7NetR = 0.0
+var bool phase7NewTrade = false
+var bool phase7NewTP1 = false
+var bool phase7NewWin = false
+var bool phase7NewLoss = false
+
+phase7NewTrade := false
+phase7NewTP1 := false
+phase7NewWin := false
+phase7NewLoss := false
+
+// Manage the live trade first, then consume a new evaluation. This allows a
+// same-bar close followed by a new trade, while a busy lifecycle ignores READY.
+if phase7ExecutionTfOk and barstate.isconfirmed and phase7StateCode == 1 and bar_index > phase7FillBarIndex
+    phase7StopHitNow = phase7Side == 1 ? low <= phase7SL : high >= phase7SL
+    phase7TP1HitNow = phase7Side == 1 ? high >= phase7TP1 : low <= phase7TP1
+    phase7TP2HitNow = phase7Side == 1 ? high >= phase7TP2 : low <= phase7TP2
+    if phase7StopHitNow or phase7TP2HitNow
+        bool phase7IsWin = phase7TP1Hit or not phase7StopHitNow
+        float phase7TradeR = not phase7IsWin ? -1.0 : phase7StopHitNow ? 0.5 * phase7TP1R - 0.5 : 0.5 * phase7TP1R + 0.5 * phase7TP2R
+        phase7Reason := not phase7IsWin ? 'LOSS_SL' : phase7StopHitNow ? 'WIN_TP1' : 'WIN_TP2'
+        phase7LastStatus := phase7IsWin ? 'CLOSED_WIN' : 'CLOSED_LOSS'
+        phase7LastEvent := phase7Reason
+        phase7Wins += phase7IsWin ? 1 : 0
+        phase7WinsTP2 += phase7IsWin and not phase7StopHitNow ? 1 : 0
+        phase7Losses += phase7IsWin ? 0 : 1
+        phase7NetR += phase7TradeR
+        phase7NewWin := phase7IsWin
+        phase7NewLoss := not phase7IsWin
+        if phase7ShowSignalUI and array.size(phase7CurrentLabels) == 4
+            _sideText = phase7Side == 1 ? 'LONG ' : 'SHORT '
+            _resultText = phase7Reason == 'LOSS_SL' ? '✕ ' + _sideText + 'LOSS ' : phase7Reason == 'WIN_TP2' ? '✓ ' + _sideText + 'WIN — TP2 ' : '✓ ' + _sideText + 'WIN — TP1 (runner closed) '
+            label.set_text(array.get(phase7CurrentLabels, 0), _resultText + phase7_r_text(phase7TradeR) + ' | entry ' + str.tostring(phase7Entry, format.mintick))
+            if phase7Reason == 'LOSS_SL'
+                label.set_text(array.get(phase7CurrentLabels, 1), 'SL ✕ HIT ' + str.tostring(phase7SL, format.mintick) + ' | -1R')
+            if phase7Reason == 'WIN_TP2'
+                label.set_text(array.get(phase7CurrentLabels, 2), 'TP1 ✓ HIT ' + str.tostring(phase7TP1, format.mintick) + ' | ' + phase7_r_text(phase7TP1R))
+                label.set_text(array.get(phase7CurrentLabels, 3), 'TP2 ✓ HIT ' + str.tostring(phase7TP2, format.mintick) + ' | ' + phase7_r_text(phase7TP2R))
+            phase7_update_visual(phase7CurrentLines, phase7CurrentLabels, bar_index)
+            phase7_fade_visual(phase7CurrentLines, phase7CurrentLabels)
+        phase7_delete_visual(phase7History2Lines, phase7History2Labels)
+        phase7History2Lines := phase7History1Lines
+        phase7History2Labels := phase7History1Labels
+        phase7History1Lines := phase7CurrentLines
+        phase7History1Labels := phase7CurrentLabels
+        phase7CurrentLines := array.new_line()
+        phase7CurrentLabels := array.new_label()
+        phase7StateCode := 0
+    else if phase7TP1HitNow and not phase7TP1Hit
+        phase7TP1Hit := true
+        phase7Reason := 'TP1_HIT_WIN'
+        phase7LastEvent := 'TP1_HIT'
+        phase7NewTP1 := true
+        if phase7ShowSignalUI and array.size(phase7CurrentLabels) == 4
+            label.set_text(array.get(phase7CurrentLabels, 2), 'TP1 ✓ HIT — WIN ' + str.tostring(phase7TP1, format.mintick) + ' | ' + phase7_r_text(phase7TP1R) + ' (50% closed)')
+            label.set_text(array.get(phase7CurrentLabels, 1), 'Runner stop ' + str.tostring(phase7SL, format.mintick) + ' (trade already a WIN)')
+
+if phase7ShowSignalUI and phase7StateCode == 1
+    phase7_update_visual(phase7CurrentLines, phase7CurrentLabels, bar_index)
+
+phase7NewEvaluation = phase7ExecutionTfOk and barstate.isconfirmed and phase7BridgeConnected and phase7EvalIsCurrentBar and (na(phase7LastProcessedEvalId) or phase7EvalId != phase7LastProcessedEvalId)
+if phase7NewEvaluation
+    phase7LastProcessedEvalId := phase7EvalId
+    if phase7StateCode != 0
+        phase7LastEvent := 'IGNORED_READY_BUSY'
+    else if phase7PackagePayloadValid
+        phase7SetupId := phase7EvalId
+        phase7Side := phase7SideCode == 1 ? 1 : -1
+        phase7ImpulseA := bridgeImpulseAInput
+        phase7ImpulseB := bridgeImpulseBInput
+        phase7ImpulseStrength := bridgeImpulseStrengthInput
+        phase7Entry := bridgeEntryInput
+        phase7SL := bridgeSLInput
+        phase7TP1 := bridgeTP1Input
+        phase7TP2 := bridgeTP2Input
+        phase7TP1R := math.abs(phase7TP1 - phase7Entry) / math.abs(phase7Entry - phase7SL)
+        phase7TP2R := math.abs(phase7TP2 - phase7Entry) / math.abs(phase7Entry - phase7SL)
+        phase7FillBarIndex := bar_index
+        phase7TP1Hit := false
+        phase7Reason := 'VALID_TRADE'
+        phase7LastStatus := 'LIVE_TRADE'
+        phase7LastEvent := 'TRADE_OPENED'
+        phase7StateCode := 1
+        phase7NewTrade := true
+        if phase7ShowSignalUI
+            phase7_create_visual(phase7CurrentLines, phase7CurrentLabels, bar_index, phase7Side, phase7Entry, phase7SL, phase7TP1, phase7TP1R, phase7TP2, phase7TP2R)
+    else
+        phase7LastEvent := not phase7BridgeValid ? 'READY_REJECTED' : 'PACKAGE_REJECTED_FAIL_SAFE'
+        phase7Reason := not phase7BridgeValid ? phase7_reason_text(phase7ReasonCode) : 'BRIDGE_PACKAGE_INVALID'
+
+phase7State = phase7StateCode == 0 ? 'NO_TRADE' : 'LIVE_TRADE'
+phase7TradeValid = phase7StateCode == 1
+
+alertcondition(phase7NewTrade, 'Engine 7 new trade', 'Engine 7 opened a trade at the trigger candle close. Entry/SL/TP1/TP2 are on the chart.')
+alertcondition(phase7NewTP1, 'Engine 7 TP1 hit (win)', 'Engine 7 TP1 reached: trade is a WIN, 50% closed, runner keeps the original stop.')
+alertcondition(phase7NewWin, 'Engine 7 trade closed as win', 'Engine 7 trade closed as a WIN (TP2, or runner closed after TP1).')
+alertcondition(phase7NewLoss, 'Engine 7 trade closed as loss', 'Engine 7 trade closed at the stop before TP1 (LOSS).')
+
+phase7_price_text(_price) =>
+    na(_price) ? '—' : str.tostring(_price, format.mintick)
+
+var table phase7DebugTable = table.new(phase7DebugPosition, 2, 11, border_width=1)
+phase7_debug_row(_row, _name, _value, _background) =>
+    table.cell(phase7DebugTable, 0, _row, _name, text_color=color.white, bgcolor=color.new(color.black, 15), text_size=size.tiny)
+    table.cell(phase7DebugTable, 1, _row, _value, text_color=color.white, bgcolor=_background, text_size=size.tiny)
+
+if barstate.islast
+    if phase7ShowDebug
+        _closed = phase7Wins + phase7Losses
+        table.cell(phase7DebugTable, 0, 0, 'ENGINE 7 EXECUTION + UI', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.tiny)
+        table.cell(phase7DebugTable, 1, 0, not phase7ExecutionTfOk ? 'Switch chart to 5m' : phase7BridgeConnected ? 'All 10 sources connected' : 'Check all 10 Brain sources', text_color=color.white, bgcolor=phase7ExecutionTfOk and phase7BridgeConnected ? color.new(color.green, 55) : color.new(color.red, 35), text_size=size.tiny)
+        phase7_debug_row(1, 'State / last', phase7State + ' / ' + phase7LastStatus, phase7StateCode == 1 ? color.new(color.green, 35) : color.new(color.gray, 75))
+        phase7_debug_row(2, 'Reason', phase7Reason, str.startswith(phase7Reason, 'WIN') or phase7Reason == 'TP1_HIT_WIN' or phase7Reason == 'VALID_TRADE' ? color.new(color.green, 45) : phase7Reason == 'LOSS_SL' ? color.new(color.red, 45) : color.new(color.orange, 55))
+        phase7_debug_row(3, 'Last event', phase7LastEvent, color.new(color.gray, 75))
+        phase7_debug_row(4, 'Impulse A / B', phase7_price_text(phase7ImpulseA) + ' / ' + phase7_price_text(phase7ImpulseB), color.new(color.gray, 75))
+        phase7_debug_row(5, 'Impulse / ATR', na(phase7ImpulseStrength) ? '—' : str.tostring(phase7ImpulseStrength, '#.##') + 'x', color.new(color.gray, 75))
+        phase7_debug_row(6, 'Side / entry', (phase7Side == 1 ? 'LONG ' : phase7Side == -1 ? 'SHORT ' : 'NONE ') + phase7_price_text(phase7Entry), color.new(color.blue, 60))
+        phase7_debug_row(7, 'SL / risk', phase7_price_text(phase7SL) + (na(phase7SL) or na(phase7Entry) ? '' : ' | $' + str.tostring(math.abs(phase7Entry - phase7SL), '#.##')) + (phase7TP1Hit and phase7StateCode == 1 ? ' | TP1 done' : ''), color.new(color.red, 60))
+        phase7_debug_row(8, 'TP1 / R', phase7_price_text(phase7TP1) + (na(phase7TP1R) ? '' : ' | ' + phase7_r_text(phase7TP1R)) + (phase7TP1Hit ? ' ✓' : ''), color.new(color.orange, 55))
+        phase7_debug_row(9, 'TP2 / R', phase7_price_text(phase7TP2) + (na(phase7TP2R) ? '' : ' | ' + phase7_r_text(phase7TP2R)), color.new(color.teal, 55))
+        phase7_debug_row(10, 'Chart results W/L', str.tostring(phase7Wins) + ' / ' + str.tostring(phase7Losses) + (_closed > 0 ? ' | WR ' + str.tostring(100.0 * phase7Wins / _closed, '#') + '% | TP2 ' + str.tostring(phase7WinsTP2) + ' | ' + phase7_r_text(phase7NetR) : ''), _closed == 0 ? color.new(color.gray, 75) : phase7NetR >= 0 ? color.new(color.green, 55) : color.new(color.red, 55))
+    else
+        table.clear(phase7DebugTable, 0, 0, 1, 10)

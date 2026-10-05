@@ -1,1 +1,8 @@
 .DS_Store
+
+# Python caches
+__pycache__/
+
+# v7 backtest: downloaded price data, caches and generated review charts (large, rebuildable)
+v7/backtest/data/
+v7/backtest/review/
