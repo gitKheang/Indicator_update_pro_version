@@ -1,4 +1,4 @@
-"""Reproduce the V7.3 tables in ../SPLIT_REPLAY_MEMORY.md (Part 1)."""
+"""Reproduce the V7.3 tables in ../README.md (Part 1)."""
 import datetime, collections
 from simple_engine import run, metrics, fmt
 from r2_common import SPLIT, TWO_Y, DAYS_ALL, DAYS_2Y

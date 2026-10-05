@@ -1,4 +1,4 @@
-"""Reproduce the V7.1 backtest figures in ../SPLIT_REPLAY_MEMORY.md.
+"""Reproduce the V7.1 backtest figures in ../README.md.
 
 Run from this folder after downloading data (see README.md):
     python3 run_v71.py

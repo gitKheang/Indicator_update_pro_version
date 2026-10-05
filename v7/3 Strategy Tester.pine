@@ -1,22 +1,20 @@
 // This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 //
-// XAUUSD Smart Trade — V7.5 STRATEGY TEST (self-contained).
-// The decision logic below is the deployed V7.5 Brain, unchanged; only the declaration
-// is strategy() and the order/results block is appended at the end. It needs no
-// indicator-on-indicator link (the Essential plan allows one per layout, used by the
-// Execution -> Brain bridge).
-//   entry : market, at the trigger candle close (process_orders_on_close)
-//   exits : TP1 share at TP1, the rest at TP2; every part keeps the ORIGINAL stop
-//           (no break-even)
-//   size  : fixed dollar risk per trade (risk / stop distance), so profit / risk = R
-//   costs : $0.15 per ounce per fill ($0.30 round trip), as in the Python backtest
-// Win/loss by the project rule: TP1 (or TP2) reached = WIN, stop before TP1 = LOSS. The
-// results table counts trades that way (stop first when one candle touches both).
-// TradingView's own "Percent profitable" counts the TP1 part and the runner part of a
-// trade as two separate trades; set "Close at TP1" to 100% to make them the same.
+// XAUUSD SMART TRADE V7.5 — 3. STRATEGY TESTER · 5-minute chart
+// For TradingView's Strategy Tester. It contains the "1. Signal Engine" logic
+// unchanged (declared as strategy(), its table and drawings off by default) plus
+// the order block at the end, so it needs no link to another indicator.
+//   Entry    : market, at the trigger candle close.
+//   Exits    : TP1 share at TP1, the rest at TP2; every part keeps the ORIGINAL
+//              stop (no break-even).
+//   Size     : fixed dollar risk per trade (risk / stop distance): profit / risk = R.
+//   Costs    : $0.15 per ounce per fill ($0.30 round trip).
+// The results table counts your rule (TP1 or TP2 = WIN, stop before TP1 = LOSS).
+// TradingView's "Profitable trades" counts the TP1 part and the runner part as two
+// trades; set "Close at TP1" to 100% to make both counts the same.
 //
 //@version=5
-strategy(title="XAUUSD Smart Trade — V7.5 Strategy Test", shorttitle="V7.5 Strategy Test", overlay=true, max_bars_back=500,
+strategy(title="XAUUSD Smart Trade V7.5 — 3. Strategy Tester", shorttitle="3. Strategy Tester", overlay=true, max_bars_back=500,
   initial_capital=10000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=1,
   pyramiding=0, process_orders_on_close=true, commission_type=strategy.commission.cash_per_contract,
   commission_value=0.15, margin_long=1, margin_short=1)
@@ -153,7 +151,7 @@ if ta.crossunder(close, btm_y) and btm_cross
 // =============================================================================
 // LEAN CORE — ATR(89): the volatility unit for stops, buffers and impulses.
 // (V7.4 removed the nine-indicator dashboard and BULB from the Brain: no
-// decision used them, and the Visual Reference script already shows that panel.)
+// decision used them, and the 4. Chart Overlay script already shows that panel.)
 // =============================================================================
 
 atrv = ta.atr(89)
@@ -1651,7 +1649,7 @@ phase5_debug_row(_row, _name, _value, _background) =>
 
 if barstate.islast
     if phase5DebugOn
-        table.cell(phase5DebugTable, 0, 0, 'PHASE 5 + ENGINE 6 BRAIN', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.tiny)
+        table.cell(phase5DebugTable, 0, 0, 'V7.5 SIGNAL ENGINE', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.tiny)
         table.cell(phase5DebugTable, 1, 0, phase5ExecutionTfOk and phase5TfHierarchyOk ? '5m chart OK' : 'Use locked 5m chart', text_color=color.white, bgcolor=phase5ExecutionTfOk and phase5TfHierarchyOk ? color.new(color.green, 55) : color.new(color.orange, 35), text_size=size.tiny)
         phase5_debug_row(1, '4H macro bias', phase5_bias_text(macro4HBias), phase5_state_color(macro4HBias))
         phase5_debug_row(2, '4H high / low', phase5_price_text(macro4HHigh) + ' / ' + phase5_price_text(macro4HLow), color.new(color.gray, 75))
@@ -1785,7 +1783,7 @@ st_row(_row, _name, _value, _bg) =>
 // A strategy only calculates on confirmed bars: draw on the last confirmed history bar too.
 if (barstate.islast or barstate.islastconfirmedhistory) and stShowTable
     _closed = stWins + stLosses
-    table.cell(stTable, 0, 0, 'V7.5 STRATEGY TEST', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.small)
+    table.cell(stTable, 0, 0, 'V7.5 STRATEGY TESTER', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.small)
     table.cell(stTable, 1, 0, stTfOk ? 'your rules: TP1/TP2 = WIN, SL first = LOSS' : 'Switch chart to 5m', text_color=color.white, bgcolor=stTfOk ? color.new(color.green, 55) : color.new(color.red, 35), text_size=size.small)
     st_row(1, 'History tested', str.format_time(stFirstTime, 'yyyy-MM-dd') + ' → ' + str.format_time(time, 'yyyy-MM-dd') + ' (' + str.tostring(stDays) + ' days)', color.new(color.gray, 75))
     st_row(2, 'Trades (per day)', str.tostring(stTrades) + ' (' + (stDays > 0 ? str.tostring(float(stTrades) / stDays, '#.##') : '—') + ')' + (stState == 1 ? ' | 1 open' : ''), color.new(color.gray, 75))

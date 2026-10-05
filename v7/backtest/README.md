@@ -4,7 +4,7 @@ A bar-by-bar Python port of the V7 Brain (Phase 5, Engine 6, Engine 7) and the
 Execution + UI lifecycle, used to measure every change in V7.1 on a large
 sample. TradingView only loads about 10,000 five-minute bars (about 50 days)
 on the current plan, far too few for 100+ trades. Results and method are in
-`../SPLIT_REPLAY_MEMORY.md`, Part 1.
+`../README.md`, Part 1.
 
 | File | Content |
 |---|---|
@@ -50,7 +50,7 @@ not for reproducing a single chart trade.
 |---|---|
 | `simple_engine.py` | V7.2 engine: 4H+1H-aligned 5m internal break, protected-swing stop (≤ $15), TP1 1.51R with clean room, TP2 2.5R or before the next opposing zone, no break-even |
 | `v72_final.py` | The V7.2 default config (`V72`) and the trades in the TradingView window |
-| `v72_report.py` | Reproduces the V7.2 comparison tables in `../SPLIT_REPLAY_MEMORY.md` |
+| `v72_report.py` | Reproduces the V7.2 comparison tables in `../README.md` |
 | `r2_common.py` | Old AOI pipeline under the new SL/TP rules (baseline) |
 | `zone_study.py`, `htf_zone_study.py` | First-touch hold rate of every 15m / 1H / 4H zone |
 | `sig_search.py`, `feat3.py` | Signal-family and feature studies at 1.5R |
@@ -61,7 +61,7 @@ not for reproducing a single chart trade.
 | File | Content |
 |---|---|
 | `v72_final.py` | Configs `V72` and **`V73`** (maintained: clean-room obstacles = Pivot S/R + EQH/EQL + 4H swing) |
-| `v73_report.py` | Reproduces the V7.3 tables in `../SPLIT_REPLAY_MEMORY.md` |
+| `v73_report.py` | Reproduces the V7.3 tables in `../README.md` |
 | `lab.py`, `lab_events.py` | Shared constructor (structural SL, liquidity/structure target pool, no break-even) and the researched setup families (sweep+CHoCH, Asia false breakout, FVG retrace, NY ORB, AOI touch, trend) |
 | `lab1.py` … `lab3.py`, `v72_iter*.py` | The iteration experiments listed in the iteration log |
 | `ml_dataset.py`, `ml_ceiling.py` | Statistical ceiling test (needs numpy + scikit-learn; run with a separate venv) |

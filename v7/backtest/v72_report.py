@@ -1,4 +1,4 @@
-"""Reproduce the V7.2 comparison table in ../SPLIT_REPLAY_MEMORY.md (Part 1)."""
+"""Reproduce the V7.2 comparison table in ../README.md (Part 1)."""
 import datetime, collections
 from simple_engine import run, metrics, fmt, T
 from r2_common import structural_hook, body_confirm, BASE, ctx, SPLIT, TWO_Y, DAYS_ALL, DAYS_2Y

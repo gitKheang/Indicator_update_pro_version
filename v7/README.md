@@ -1,4 +1,48 @@
-# v7 — XAUUSD Smart Trade (Brain + Execution + UI)
+# v7 — XAUUSD Smart Trade V7.5
+
+Indicator system for XAUUSD on the 5-minute chart (TradingView, Pine Script v5).
+
+## Files
+
+| File | Name on TradingView | What it does |
+|---|---|---|
+| `1 Brain - Signal Engine.pine` | XAUUSD Smart Trade V7.5 — 1. Signal Engine (Brain) | Decides every trade (details below). Sends the trade to the Trade Manager through ten hidden `BRIDGE_*` plots, and shows a status table and the decision levels on the chart |
+| `2 Execution - Trade Manager.pine` | XAUUSD Smart Trade V7.5 — 2. Trade Manager (Execution) | Runs each trade with your win/loss rule (details below). Draws entry/SL/TP lines and result labels, and keeps the scoreboard and alerts |
+| `3 Strategy Tester.pine` | XAUUSD Smart Trade V7.5 — 3. Strategy Tester | The Signal Engine logic as a `strategy()` for TradingView's Strategy Tester: same rules, fixed $ risk per trade, costs included. Needs no link to another indicator |
+| `4 Chart Overlay - SMC ICT.pine` | XAUUSD Smart Trade — 4. Chart Overlay (SMC & ICT) | Visual reference only: SMC structure, order blocks, FVGs, EQH/EQL, premium/discount, supply/demand, pivots, candle patterns and the nine-indicator direction panel. No trade decision uses it |
+| `README.md` | — | This file: rules, results, research, deployment notes and history |
+| `backtest/` | — | Python port of the system and the research scripts. Price data is downloaded locally and not stored in git |
+
+- **1. Signal Engine decides every trade:**
+  - **Trend:** 4H + 1H trend must agree.
+  - **Trigger:** 5m structure break with the 5m Supertrend agreeing, plus the fast-pullback and calm-1H filters.
+  - **Stop:** structural, at most $15.
+  - **Targets:** TP1 at 1.51R with clean room, TP2 beyond it.
+- **2. Trade Manager runs each trade:**
+  - Entry at the trigger close.
+  - 50% closes at TP1, which makes the trade a WIN.
+  - The runner goes for TP2 with the original stop (no break-even).
+  - The trade is a LOSS only if the SL comes first.
+
+**Setup on a 5-minute XAUUSD chart:**
+1. Add **1. Signal Engine**.
+2. Add **2. Trade Manager** and map its ten *Brain Bridge* inputs, in order,
+   to the Signal Engine's `BRIDGE_*` plots.
+3. Optionally, add **4. Chart Overlay** for the visual drawings.
+4. To see the Strategy Tester, add **3. Strategy Tester** on its own.
+
+Your Essential plan allows one indicator-on-indicator link per chart layout,
+and the link from 2 to 1 uses it.
+
+**Renamed on 5 October 2026.** Part 2 keeps the names used at the time:
+
+| Old name in Part 2 | Current name |
+|---|---|
+| Brain | 1. Signal Engine |
+| Execution + UI | 2. Trade Manager |
+| V7.5 Strategy Test | 3. Strategy Tester |
+| Visual Reference | 4. Chart Overlay |
+| `SPLIT_REPLAY_MEMORY.md` | this `README.md` |
 
 This file has two parts:
 
@@ -354,8 +398,8 @@ Charts were rendered from the same price data (`backtest/render.py`,
 
 ### TradingView Strategy Tester — V7.5 Strategy Test (5 October 2026)
 
-- **Script.** `XAUUSD Smart Trade V7.5 Strategy Test.pine` ("XAUUSD Smart Trade —
-  V7.5 Strategy Test" on TradingView, chart instance `OXidda`).
+- **Script.** `3 Strategy Tester.pine` ("XAUUSD Smart Trade V7.5 — 3. Strategy
+  Tester" on TradingView, chart instance `OXidda`).
   - It is the deployed V7.5 Brain code, unchanged, declared as `strategy()`,
     with an order block appended.
   - **Entry:** market at the trigger close.
@@ -393,10 +437,16 @@ Charts were rendered from the same price data (`backtest/render.py`,
 
 ### Fingerprints
 
-- Brain: 1,682 lines — SHA-256 `7548b4ba14b710d5063139f09e86ae417e0b042f8ae1f54dfe76652c22b809ce` (TradingView v13)
-- Execution + UI (unchanged): 298 lines — SHA-256 `bfabd5f6337f9064412b7e81445026f5711a68c42de5e292b3ca25cca40ed9f8` (TradingView v10)
-- Visual Reference (unchanged): 2,474 lines — SHA-256 `c28ab486d9f59dbbb28dda13a61e5cef61484799b2cec3df9719258488fda225`
-- V7.5 Strategy Test: 1,799 lines — SHA-256 `5d414df5ade44d42ce410ab2553123269d65d1e4468ab1b5f1fc472acf560bd4` (TradingView v3)
+Renamed and re-saved on 5 October 2026, 22:12 UTC+7. Only the names, header
+descriptions and table titles changed; the trading logic is the same as V7.5
+above. On TradingView each chart instance updated in place, and the Trade
+Manager was re-linked to the Signal Engine (`6J83Ka$0..$9`, "All 10 sources
+connected").
+
+- `1 Brain - Signal Engine.pine`: 1,693 lines — SHA-256 `9d8b4306a96b626a6269dd447d5109f583ca925ba6a729d4e08794c8d825b76c` (TradingView v14)
+- `2 Execution - Trade Manager.pine`: 303 lines — SHA-256 `7a0632d318b86295f1ef9972b3e211abafcc474397cd19090b7fed4c4c84fd3d` (TradingView v11)
+- `3 Strategy Tester.pine`: 1,797 lines — SHA-256 `11f08b79f0773e371bb848b957d4580d9bd6eaf28e6bd2753cd5587e612dfb07` (TradingView v4)
+- `4 Chart Overlay - SMC ICT.pine`: 2,482 lines — SHA-256 `bbe79ea60242cb7973768d9d709dd6736023ab0761a9cf7864a2f34a3f96eb45` (TradingView v5)
 - Backtest scripts:
   - `backtest/v75_report.py`: the V7.5 tables;
   - `v75_lab.py`: setups, features, one-position replay;
