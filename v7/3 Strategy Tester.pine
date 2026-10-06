@@ -7,7 +7,8 @@
 //   Entry    : market, at the trigger candle close.
 //   Exits    : TP1 share at TP1, the rest at TP2; every part keeps the ORIGINAL
 //              stop (no break-even).
-//   Size     : fixed dollar risk per trade (risk / stop distance): profit / risk = R.
+//   Size     : fixed lot (default 0.01 lot = 1 oz: a $1 move = $1), or fixed dollar
+//              risk per trade (risk / stop distance, profit / risk = R).
 //   Costs    : $0.15 per ounce per fill ($0.30 round trip).
 // The results table counts your rule (TP1 or TP2 = WIN, stop before TP1 = LOSS).
 // TradingView's "Profitable trades" counts the TP1 part and the runner part as two
@@ -1724,7 +1725,9 @@ if barstate.islast
 // =============================================================================
 // STRATEGY TESTER — ORDERS AND RESULTS (appended; the logic above is the Signal Engine)
 // =============================================================================
-stRiskUSD = input.float(100.0, 'Risk per trade ($)', minval=1.0, step=10.0, group='Strategy test', tooltip='Position size = risk / stop distance, so net profit / risk = net R.')
+stSizeMode = input.string('Fixed lot', 'Position size', options=['Fixed lot', 'Fixed $ risk'], group='Strategy test', tooltip='Fixed lot: the same lot on every trade. Fixed $ risk: lot = risk / stop distance, so net profit / risk = net R.')
+stLots = input.float(0.01, 'Lot size (1 lot = 100 oz)', minval=0.01, step=0.01, group='Strategy test', tooltip='0.01 lot = 1 oz of gold: a $1 price move = $1 profit or loss. A broker cannot split 0.01 lot, so with 0.01 lot set "Close at TP1" to 100% to match real trading; use 0.02 lot or more for the 50% split.')
+stRiskUSD = input.float(100.0, 'Risk per trade ($, Fixed $ risk mode)', minval=1.0, step=10.0, group='Strategy test', tooltip='Position size = risk / stop distance, so net profit / risk = net R.')
 stTP1ClosePct = input.int(50, 'Close at TP1 (%)', minval=1, maxval=100, group='Strategy test', tooltip='50 = the V7.5 system (runner to TP2 with the original stop). 100 = close everything at TP1; TradingView\'s "Percent profitable" then equals the project win rate.')
 stShowTable = input.bool(true, 'Show results table', group='Strategy test')
 stTablePosition = input.string(position.middle_right, 'Results table position', options=[position.middle_right, position.top_right, position.top_left, position.bottom_right, position.bottom_left, position.middle_left], group='Strategy test')
@@ -1791,7 +1794,7 @@ if stNewPackage and stState == 0 and strategy.position_size == 0
     stTP1Hit := false
     stState := 1
     stTrades += 1
-    float stQty = stRiskUSD / (math.abs(stEntry - stSL) * syminfo.pointvalue)
+    float stQty = stSizeMode == 'Fixed lot' ? stLots * 100.0 / syminfo.pointvalue : stRiskUSD / (math.abs(stEntry - stSL) * syminfo.pointvalue)
     string stId = stSide == 1 ? 'LONG' : 'SHORT'
     strategy.entry(stId, stSide == 1 ? strategy.long : strategy.short, qty=stQty)
     if stTP1ClosePct < 100
@@ -1819,7 +1822,7 @@ if (barstate.islast or barstate.islastconfirmedhistory) and stShowTable
     st_row(4, 'Win rate (TP1 before SL)', _closed > 0 ? str.tostring(100.0 * stWins / _closed, '#.#') + '%' : '—', _closed == 0 ? color.new(color.gray, 75) : color.new(color.teal, 45))
     st_row(5, 'Net R (before costs)', st_r_text(stNetR), stNetR >= 0 ? color.new(color.green, 55) : color.new(color.red, 55))
     st_row(6, 'Max drawdown (R)', str.tostring(stMaxDDR, '#.##') + 'R', color.new(color.gray, 75))
-    st_row(7, 'Net profit $ (after costs)', str.tostring(strategy.netprofit, '#,###.##') + ' | risk $' + str.tostring(stRiskUSD, '#'), strategy.netprofit >= 0 ? color.new(color.green, 55) : color.new(color.red, 55))
+    st_row(7, 'Net profit $ (after costs)', str.tostring(strategy.netprofit, '#,###.##') + (stSizeMode == 'Fixed lot' ? ' | ' + str.tostring(stLots, '#.##') + ' lot' : ' | risk $' + str.tostring(stRiskUSD, '#')), strategy.netprofit >= 0 ? color.new(color.green, 55) : color.new(color.red, 55))
     st_row(8, 'Profit factor $', strategy.grossloss > 0 ? str.tostring(strategy.grossprofit / strategy.grossloss, '#.##') : '—', color.new(color.gray, 75))
     st_row(9, 'Max drawdown $', str.tostring(strategy.max_drawdown, '#,###.##'), color.new(color.gray, 75))
     st_row(10, 'Close at TP1', str.tostring(stTP1ClosePct) + '%' + (stTP1ClosePct < 100 ? ' | runner keeps the original SL' : ''), color.new(color.gray, 75))

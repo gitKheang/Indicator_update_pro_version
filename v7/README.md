@@ -126,6 +126,27 @@ plan loads):
   extra TradingView losers are borderline setups decided by small OANDA price
   differences, as found in V7.6.
 
+**Strategy Tester at a fixed 0.01 lot** (added on request; Strategy Tester
+v9). Position size is now an input: *Fixed lot* (default **0.01 lot = 1 oz**,
+so a $1 move = $1) or *Fixed $ risk*. Costs: $0.30 per oz round trip.
+
+| 0.01 lot | Trades | Win rate | Net profit | PF | Max drawdown |
+|---|---|---|---|---|---|
+| Backtest Jan 2024 – Oct 2026, 50% at TP1 | 417 | 53.0% | **+$1,107.80** | 1.69 | $104.48 |
+| Backtest, everything closed at TP1 | 498 | 52.0% | +$1,048.28 | 1.54 | $94.85 |
+| Backtest, latest 6 months, 50% at TP1 | 47 | 68.1% | +$278.21 | 2.65 | $34.47 |
+| TradingView (9 Aug – 5 Oct), 50% at TP1 | 11 | 63.6% | +$48.66 | 1.82 | $35.80 |
+| TradingView, everything closed at TP1 | 13 | 53.8% | +$58.82 | 1.91 | $37.40 |
+
+- Backtest by year at 0.01 lot with the 50% split: 2024 +$135.51, 2025
+  +$493.17, 2026 +$479.13. 2024 earned less because stops were smaller in
+  dollars when gold was cheaper.
+- **A broker cannot split 0.01 lot.** To match real trading at 0.01 lot, set
+  *Close at TP1* to 100%. To keep the 50% split, use 0.02 lot (0.01 + 0.01),
+  which doubles every dollar figure: backtest +$2,215.60, max drawdown
+  $208.96.
+- `backtest/v78_lots.py` reproduces the backtest rows.
+
 **Deployment (6 October 2026):**
 
 - **Versions:** Signal Engine v16, Strategy Tester v8. The Trade Manager (v14)
@@ -138,7 +159,7 @@ plan loads):
 **Fingerprints:**
 
 - `1 Brain - Signal Engine.pine`: SHA-256 `f79745b52ebf815d403eb9697cf215920fbf563619922236f408a647b0c22c42` (TradingView v16)
-- `3 Strategy Tester.pine`: SHA-256 `59b7741eaef87bcf3eb95beaff68f40a471c1a6fd3c03309dda257573e0a5e40` (TradingView v8)
+- `3 Strategy Tester.pine`: SHA-256 `cc0ef4add6602a3ef8065900285d3fac350c6e98945e662a0eee3c9071ebdad6` (TradingView v9, fixed-lot sizing)
 - `2 Execution - Trade Manager.pine`: unchanged from V7.6 (`d5d9d9de…`, TradingView v14)
 
 
