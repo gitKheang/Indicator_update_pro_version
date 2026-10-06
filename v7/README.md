@@ -1,4 +1,4 @@
-# v7 — XAUUSD Smart Trade V7.6
+# v7 — XAUUSD Smart Trade V7.8
 
 Indicator system for XAUUSD on the 5-minute chart (TradingView, Pine Script v5).
 
@@ -15,7 +15,7 @@ Indicator system for XAUUSD on the 5-minute chart (TradingView, Pine Script v5).
 
 - **1. Signal Engine decides every trade:**
   - **Trend:** 4H + 1H trend must agree.
-  - **Trigger:** 5m structure break with the 5m Supertrend, Ichimoku Tenkan/Kijun and an RSI(14) cap agreeing, plus the fast-pullback filter (the calm-1H filter is optional).
+  - **Trigger:** 5m structure break with the 5m Supertrend agreeing. Since V7.8 the Ichimoku Tenkan/Kijun, RSI(14) cap, fast-pullback and calm-1H filters are inputs that are OFF by default (chosen for profit, not win rate).
   - **Stop:** structural, at most $15.
   - **Targets:** TP1 at 1.51R with clean room, TP2 beyond it.
 - **2. Trade Manager runs each trade:**
@@ -46,15 +46,101 @@ and the link from 2 to 1 uses it.
 
 This file has two parts:
 
-1. **Current system: V7.6** (below). The maintained logic, values, research,
-   backtest and validation as of 6 October 2026. Read this first.
+1. **Current system: V7.8** (below): V7.6 with three filters switched off,
+   chosen for profit. The V7.6 sections that follow it still describe the
+   engine, the data and the research. Read this first.
 2. **Change history.** V7.5, V7.4, V7.3, V7.2, V7.1, the earlier logic review, and the split,
    memory, bridge and lifecycle repairs. Anything there that conflicts with
    Part 1 is superseded.
 
 ---
 
-## Part 1 — Current system: V7.6 (6 October 2026)
+## Part 1 — Current system: V7.8 (6 October 2026)
+
+### V7.8: chosen for profit, not win rate
+
+You asked which tested rule set makes the most money if the win rate does not
+matter, and chose the recommended one. V7.8 is V7.6 with three filters
+switched **off** by default:
+
+- the fast-pullback filter (break at most 11 bars after the broken pivot);
+- Ichimoku Tenkan/Kijun agreement;
+- the RSI(14) overextension cap.
+
+They remain inputs in *Engine 6 — Trigger*. Everything else is unchanged: 4H +
+1H trend, 5m structure break with Supertrend, structural SL ≤ $15, clean room,
+TP1 1.51R, TP2 > TP1, 50% at TP1, no break-even. The Trade Manager is
+unchanged.
+
+**Every tested rule set, net profit** (repaired data, $0.30/oz costs, one
+trade at a time, 1R risk per trade):
+
+| Rule set | Older 2.25 years (Jan 2024 – Apr 2026) | Latest 6 months | Full 2.75 years | Trades / win rate / max drawdown (full) |
+|---|---|---|---|---|
+| V7.3-style (no Supertrend, fast or chop filter) | +116.0R | +29.7R | +145.7R | 557 / 50.4% / 13.5R |
+| V7.6 without Ichimoku/RSI | +116.5R | +26.9R | +143.4R | 332 / 56.3% / 10.2R |
+| **V7.8 (no fast-pullback, no Ichimoku/RSI)** | **+116.3R** | **+27.0R** | **+143.3R** | **417 / 53.0% / 8.5R** |
+| V7.5 (calm-1H filter) | +110.7R | +13.5R | +124.2R | 241 / 59.8% / 8.0R |
+| 1H trend only | +101.6R | +19.8R | +121.4R | 611 / 47.8% / 11.2R |
+| V7.6 | +86.3R | +28.3R | +114.5R | 250 / 58.4% / 8.3R |
+| No clean room | +93.8R | +18.9R | +112.7R | 789 / 45.2% / 39.2R |
+| No higher-timeframe trend | +27.9R | +11.1R | +39.0R | 1,047 / 42.1% / 26.2R |
+
+- **Why V7.8:** practically tied for the most profit, the smallest drawdown
+  of the top three, near the top in both periods, and fewer filters tuned on
+  the latest 6 months.
+- **Break-even After TP1** adds 2–4R in the latest 6 months but costs 6–21R
+  on the older history, so it stays off.
+
+**V7.8 backtest, Jan 2024 – Oct 2026** (`backtest/v78_report.py`):
+
+| Period | Trades | Win rate | Net | PF | Max drawdown |
+|---|---|---|---|---|---|
+| 2024 | 158 | 49.4% | +38.9R | 1.46 | 7.4R |
+| 2025 | 190 | 51.6% | +61.3R | 1.64 | 6.7R |
+| 2026 (to 4 Oct) | 69 | 65.2% | +43.1R | 2.75 | 5.5R |
+| **All** | **417** | **53.0%** | **+143.3R** | **1.70** | **8.5R** |
+
+- Outcomes: 177 TP2, 44 TP1 then stop, 196 SL. Longest losing streak: 7.
+- Largest stop $14.92, median $7.62.
+- Losing months: 4 of 31. The worst was −3.3R (November 2024).
+- About $14,300 over the 2.75 years at $100 risk per trade.
+- No trades from 5 September to 4 October 2026: the 4H and 1H trends
+  disagreed the whole time.
+
+**TradingView Strategy Tester** (OANDA, 9 Aug – 5 Oct 2026, the history your
+plan loads):
+
+| | V7.6 | **V7.8** |
+|---|---|---|
+| Trades | 7 | **11** |
+| Wins / losses | 5 / 2 | **7 / 4** |
+| Win rate | 71.4% | **63.6%** |
+| Net R | +5.95R | **+6.21R** |
+| Net profit at $100 risk (after costs) | $573 | **$587** |
+| Profit factor ($) | 3.24 | **2.14** |
+| Max drawdown ($) | — | **$296** |
+
+- The Trade Manager shows the same 7 / 4, +6.21R.
+- The Python backtest has 9 of these trades (7 W / 2 L, +7.8R). The two
+  extra TradingView losers are borderline setups decided by small OANDA price
+  differences, as found in V7.6.
+
+**Deployment (6 October 2026):**
+
+- **Versions:** Signal Engine v16, Strategy Tester v8. The Trade Manager (v14)
+  and Chart Overlay (v5) are unchanged.
+- **Inputs:** the three filters read OFF on both chart instances.
+- **Link:** "All 10 sources connected".
+- **Layout:** saved as you had it (5m, your manual price range, your 5
+  drawings).
+
+**Fingerprints:**
+
+- `1 Brain - Signal Engine.pine`: SHA-256 `f79745b52ebf815d403eb9697cf215920fbf563619922236f408a647b0c22c42` (TradingView v16)
+- `3 Strategy Tester.pine`: SHA-256 `59b7741eaef87bcf3eb95beaff68f40a471c1a6fd3c03309dda257573e0a5e40` (TradingView v8)
+- `2 Execution - Trade Manager.pine`: unchanged from V7.6 (`d5d9d9de…`, TradingView v14)
+
 
 ### Your rules and targets (latest request)
 

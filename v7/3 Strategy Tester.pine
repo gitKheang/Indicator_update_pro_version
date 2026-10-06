@@ -1,6 +1,6 @@
 // This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 //
-// XAUUSD SMART TRADE V7.6 — 3. STRATEGY TESTER · 5-minute chart
+// XAUUSD SMART TRADE V7.8 — 3. STRATEGY TESTER · 5-minute chart
 // For TradingView's Strategy Tester. It contains the "1. Signal Engine" logic
 // unchanged (declared as strategy(), its table and drawings off by default) plus
 // the order block at the end, so it needs no link to another indicator.
@@ -1356,6 +1356,11 @@ exec5mATRLive = phase5ExecAtrLive
 //   * Result on those 6 months: 32 trades, 81.2% win rate, PF 5.59 (V7.5: 24
 //     trades, 70.8%). On older data (2024-01..2026-04) the same rules win 55.0%
 //     (V7.5: 58.5%), so the gain depends on the current market regime.
+// V7.8 (chosen for profit, not win rate): fast pullback, Ichimoku TK and RSI cap
+//   OFF by default. Backtest 2024-01..2026-10 (costs, one trade at a time):
+//   417 trades, 53.0% win rate, +143.3R, PF 1.70, max DD 8.5R
+//   (V7.6: 250 trades, 58.4%, +114.5R, PF 2.04, max DD 8.3R).
+//   Latest 6 months: 47 trades, 68.1%, +27.0R (V7.6: 32, 81.2%, +28.3R).
 // V7.2 removed the former AOI score/lock/touch/confirm pipeline. Measured on
 // XAUUSD 5m 2024-01..2026-10: first touches of every Phase-5 zone family held
 // only 34–44% of the time at 1.5R (a level with no edge ≈ 40%), on 15m, 1H and
@@ -1380,13 +1385,13 @@ phase6StPeriod = input.int(10, 'Supertrend ATR period', minval=1, group='Engine 
 // ta.supertrend direction is negative while the trend is up.
 phase6StTrend = phase6StDirection < 0 ? 1 : -1
 
-phase6UseFastPullback = input.bool(true, 'Require fast pullback', group='Engine 6 — Trigger', tooltip='Trade only when the break comes within the set number of 5m bars after the broken internal swing pivot: a quick pullback that resumes the trend. Backtest 2024-01..2026-10: breaks 12+ bars after the pivot won 42.5%.')
+phase6UseFastPullback = input.bool(false, 'Require fast pullback', group='Engine 6 — Trigger', tooltip='Trade only when the break comes within the set number of 5m bars after the broken internal swing pivot: a quick pullback that resumes the trend. Backtest 2024-01..2026-10: breaks 12+ bars after the pivot won 42.5%.')
 phase6MaxPullbackBars = input.int(11, 'Max bars from broken pivot to break', minval=6, maxval=200, group='Engine 6 — Trigger')
 phase6UseCalm1H = input.bool(false, 'Require calm 1H (Choppiness Index)', group='Engine 6 — Trigger', tooltip='Choppiness Index (E.W. Dreiss) of the last completed 1H bar must be below the maximum. OFF by default since V7.6: on the latest 6 months it removed winning trades (24 vs 40 trades at a similar win rate). On 2024-2025 data it helped (58.5% vs 54.1%).')
 phase6ChopLength = input.int(14, '1H Choppiness length', minval=2, group='Engine 6 — Trigger')
 phase6ChopMax = input.float(50.0, '1H Choppiness maximum', minval=0.0, maxval=100.0, step=1.0, group='Engine 6 — Trigger')
-phase6UseTK = input.bool(true, 'Require Ichimoku Tenkan/Kijun agreement', group='Engine 6 — Trigger', tooltip='Ichimoku (Goichi Hosoda): Tenkan-sen = midpoint of the last 9 bars, Kijun-sen = midpoint of the last 26 bars, on the 5m chart. Longs only when Tenkan is above Kijun, shorts only when below: short-term momentum agrees with the trade.')
-phase6UseRsiCap = input.bool(true, 'Skip overextended entries (RSI 14)', group='Engine 6 — Trigger', tooltip='No long when RSI(14) is at or above the overbought level, no short when at or below the oversold level: avoids buying the top / selling the bottom of an extended move.')
+phase6UseTK = input.bool(false, 'Require Ichimoku Tenkan/Kijun agreement', group='Engine 6 — Trigger', tooltip='Ichimoku (Goichi Hosoda): Tenkan-sen = midpoint of the last 9 bars, Kijun-sen = midpoint of the last 26 bars, on the 5m chart. Longs only when Tenkan is above Kijun, shorts only when below: short-term momentum agrees with the trade.')
+phase6UseRsiCap = input.bool(false, 'Skip overextended entries (RSI 14)', group='Engine 6 — Trigger', tooltip='No long when RSI(14) is at or above the overbought level, no short when at or below the oversold level: avoids buying the top / selling the bottom of an extended move.')
 phase6RsiHigh = input.float(70.0, 'RSI overbought (no longs at/above)', minval=50.0, maxval=100.0, step=1.0, group='Engine 6 — Trigger')
 phase6RsiLow = input.float(30.0, 'RSI oversold (no shorts at/below)', minval=0.0, maxval=50.0, step=1.0, group='Engine 6 — Trigger')
 phase6Tenkan = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2
@@ -1671,7 +1676,7 @@ phase5_debug_row(_row, _name, _value, _background) =>
 
 if barstate.islast
     if phase5DebugOn
-        table.cell(phase5DebugTable, 0, 0, 'V7.6 SIGNAL ENGINE', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.tiny)
+        table.cell(phase5DebugTable, 0, 0, 'V7.8 SIGNAL ENGINE', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.tiny)
         table.cell(phase5DebugTable, 1, 0, phase5ExecutionTfOk and phase5TfHierarchyOk ? '5m chart OK' : 'Use locked 5m chart', text_color=color.white, bgcolor=phase5ExecutionTfOk and phase5TfHierarchyOk ? color.new(color.green, 55) : color.new(color.orange, 35), text_size=size.tiny)
         phase5_debug_row(1, '4H macro bias', phase5_bias_text(macro4HBias), phase5_state_color(macro4HBias))
         phase5_debug_row(2, '4H high / low', phase5_price_text(macro4HHigh) + ' / ' + phase5_price_text(macro4HLow), color.new(color.gray, 75))
@@ -1806,7 +1811,7 @@ st_row(_row, _name, _value, _bg) =>
 // A strategy only calculates on confirmed bars: draw on the last confirmed history bar too.
 if (barstate.islast or barstate.islastconfirmedhistory) and stShowTable
     _closed = stWins + stLosses
-    table.cell(stTable, 0, 0, 'STRATEGY TESTER (V7.6)', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.small)
+    table.cell(stTable, 0, 0, 'STRATEGY TESTER (V7.8)', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.small)
     table.cell(stTable, 1, 0, stTfOk ? 'your rules: TP1/TP2 = WIN, SL first = LOSS' : 'Switch chart to 5m', text_color=color.white, bgcolor=stTfOk ? color.new(color.green, 55) : color.new(color.red, 35), text_size=size.small)
     st_row(1, 'History tested', str.format_time(stFirstTime, 'yyyy-MM-dd') + ' → ' + str.format_time(time, 'yyyy-MM-dd') + ' (' + str.tostring(stDays) + ' days)', color.new(color.gray, 75))
     st_row(2, 'Trades (per day)', str.tostring(stTrades) + ' (' + (stDays > 0 ? str.tostring(float(stTrades) / stDays, '#.##') : '—') + ')' + (stState == 1 ? ' | 1 open' : ''), color.new(color.gray, 75))
