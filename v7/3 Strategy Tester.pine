@@ -1,17 +1,20 @@
 // This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 //
-// XAUUSD SMART TRADE V7.6 — 3. STRATEGY TESTER · 5-minute chart
+// XAUUSD SMART TRADE V7.7 — 3. STRATEGY TESTER · 5-minute chart
 // For TradingView's Strategy Tester. It contains the "1. Signal Engine" logic
 // unchanged (declared as strategy(), its table and drawings off by default) plus
 // the order block at the end, so it needs no link to another indicator.
 //   Entry    : market, at the trigger candle close.
-//   Exits    : TP1 share at TP1, the rest at TP2; every part keeps the ORIGINAL
-//              stop (no break-even).
+//   Exits    : TP1 share at TP1, the rest at TP2.
+//   Break-even (input, same as "2. Trade Manager"): Off / After TP1 / Before TP1
+//              at +X R (default +0.75R). Armed on a bar close, the stop of every
+//              open part moves to entry (+ offset) from the next bar.
 //   Size     : fixed dollar risk per trade (risk / stop distance): profit / risk = R.
 //   Costs    : $0.15 per ounce per fill ($0.30 round trip).
-// The results table counts your rule (TP1 or TP2 = WIN, stop before TP1 = LOSS).
-// TradingView's "Profitable trades" counts the TP1 part and the runner part as two
-// trades; set "Close at TP1" to 100% to make both counts the same.
+// The results table counts your rule (TP1 or TP2 = WIN, original stop before TP1 =
+// LOSS, break-even stop before TP1 = BE, neither). TradingView's "Profitable
+// trades" counts the TP1 part and the runner part as two trades and a break-even
+// exit as a small loss (costs); set "Close at TP1" to 100% for one fill per trade.
 //
 //@version=5
 strategy(title="XAUUSD Smart Trade — 3. Strategy Tester", shorttitle="3. Strategy Tester", overlay=true, max_bars_back=500,
@@ -1720,9 +1723,12 @@ if barstate.islast
 // STRATEGY TESTER — ORDERS AND RESULTS (appended; the logic above is the Signal Engine)
 // =============================================================================
 stRiskUSD = input.float(100.0, 'Risk per trade ($)', minval=1.0, step=10.0, group='Strategy test', tooltip='Position size = risk / stop distance, so net profit / risk = net R.')
-stTP1ClosePct = input.int(50, 'Close at TP1 (%)', minval=1, maxval=100, group='Strategy test', tooltip='50 = the V7.5 system (runner to TP2 with the original stop). 100 = close everything at TP1; TradingView\'s "Percent profitable" then equals the project win rate.')
+stTP1ClosePct = input.int(50, 'Close at TP1 (%)', minval=1, maxval=100, group='Strategy test', tooltip='50 = the system (half closed at TP1, runner to TP2). 100 = close everything at TP1; with break-even Off, TradingView\'s "Percent profitable" then equals the project win rate.')
 stShowTable = input.bool(true, 'Show results table', group='Strategy test')
 stTablePosition = input.string(position.middle_right, 'Results table position', options=[position.middle_right, position.top_right, position.top_left, position.bottom_right, position.bottom_left, position.middle_left], group='Strategy test')
+stBeMode = input.string('Before TP1 at +R', 'Break-even', options=['Off', 'After TP1', 'Before TP1 at +R'], group='Strategy test — Break-even', tooltip='Before TP1 at +R: once price has moved the trigger distance in favour (bar high/low, checked at the bar close), every open part gets its stop at entry from the next bar; a stop there before TP1 is BE (not a win, not a loss). After TP1: only the runner stop moves to entry.')
+stBeTriggerR = input.float(0.75, 'Break-even trigger (R in favour, before TP1)', minval=0.1, maxval=1.5, step=0.05, group='Strategy test — Break-even')
+stBeOffsetR = input.float(0.0, 'Break-even stop offset (R beyond entry)', minval=0.0, maxval=0.5, step=0.05, group='Strategy test — Break-even', tooltip='0 = exactly at entry. A small offset (e.g. 0.05R) can cover spread/commission.')
 
 stTfOk = timeframe.period == '5'
 // A new valid Engine 7 package on its own trigger bar: the same event the Execution
@@ -1741,9 +1747,12 @@ var float stTP1R = na
 var float stTP2R = na
 var int stFillBar = na
 var bool stTP1Hit = false
+var bool stBeArmed = false
+var float stQtyOpen = na
 var int stTrades = 0
 var int stWins = 0
 var int stLosses = 0
+var int stBEs = 0
 var int stWinsTP2 = 0
 var float stNetR = 0.0
 var float stPeakR = 0.0
@@ -1758,14 +1767,20 @@ stPart = stTP1ClosePct / 100.0
 
 // Manage the live trade first (stop first when one candle touches both), then open.
 if stTfOk and barstate.isconfirmed and stState == 1 and bar_index > stFillBar
-    stStopNow = stSide == 1 ? low <= stSL : high >= stSL
+    float stRisk = math.abs(stEntry - stSL)
+    float stBeLevel = stEntry + stSide * stBeOffsetR * stRisk
+    float stStopLevel = stBeArmed ? stBeLevel : stSL
+    stStopNow = stSide == 1 ? low <= stStopLevel : high >= stStopLevel
     stTP1Now = stSide == 1 ? high >= stTP1 : low <= stTP1
     stTP2Now = stSide == 1 ? high >= stTP2 : low <= stTP2
     if stStopNow or stTP2Now or (stTP1Now and stPart >= 1.0)
         bool stIsWin = stTP1Hit or not stStopNow
-        float stR = not stIsWin ? -1.0 : stPart >= 1.0 ? stTP1R : stStopNow ? stPart * stTP1R - (1 - stPart) : stPart * stTP1R + (1 - stPart) * stTP2R
+        bool stIsBE = not stIsWin and stBeArmed
+        float stRunnerR = stBeArmed ? stBeOffsetR : -1.0
+        float stR = stIsBE ? stBeOffsetR : not stIsWin ? -1.0 : stPart >= 1.0 ? stTP1R : stStopNow ? stPart * stTP1R + (1 - stPart) * stRunnerR : stPart * stTP1R + (1 - stPart) * stTP2R
         stWins += stIsWin ? 1 : 0
-        stLosses += stIsWin ? 0 : 1
+        stBEs += stIsBE ? 1 : 0
+        stLosses += stIsWin or stIsBE ? 0 : 1
         stWinsTP2 += stIsWin and not stStopNow and stPart < 1.0 ? 1 : 0
         stNetR += stR
         stPeakR := math.max(stPeakR, stNetR)
@@ -1773,6 +1788,22 @@ if stTfOk and barstate.isconfirmed and stState == 1 and bar_index > stFillBar
         stState := 0
     else if stTP1Now and not stTP1Hit
         stTP1Hit := true
+    // Arm break-even on this bar's close: the open exit orders get the entry stop
+    // from the next bar. 'TP1' is re-sent only while its part is still open.
+    if stState == 1 and not stBeArmed and stBeMode != 'Off'
+        float _fav = stSide == 1 ? high - stEntry : stEntry - low
+        bool _arm = stBeMode == 'After TP1' ? stTP1Hit : stTP1Hit or _fav >= stBeTriggerR * stRisk
+        if _arm
+            stBeArmed := true
+            string _id = stSide == 1 ? 'LONG' : 'SHORT'
+            bool _fullOpen = math.abs(strategy.position_size) >= 0.999 * stQtyOpen
+            if strategy.position_size != 0
+                if stTP1ClosePct >= 100
+                    strategy.exit('TP1', from_entry=_id, limit=stTP1, stop=stBeLevel, comment_profit='TP1 WIN', comment_loss='BE before TP1')
+                else
+                    if _fullOpen
+                        strategy.exit('TP1', from_entry=_id, qty_percent=stTP1ClosePct, limit=stTP1, stop=stBeLevel, comment_profit='TP1 WIN', comment_loss='BE before TP1')
+                    strategy.exit('TP2', from_entry=_id, qty_percent=100, limit=stTP2, stop=stBeLevel, comment_profit='TP2 WIN', comment_loss=_fullOpen ? 'BE before TP1' : 'Runner at BE')
 
 if stNewPackage and stState == 0 and strategy.position_size == 0
     stSide := phase7Side
@@ -1784,9 +1815,11 @@ if stNewPackage and stState == 0 and strategy.position_size == 0
     stTP2R := math.abs(stTP2 - stEntry) / math.abs(stEntry - stSL)
     stFillBar := bar_index
     stTP1Hit := false
+    stBeArmed := false
     stState := 1
     stTrades += 1
     float stQty = stRiskUSD / (math.abs(stEntry - stSL) * syminfo.pointvalue)
+    stQtyOpen := stQty
     string stId = stSide == 1 ? 'LONG' : 'SHORT'
     strategy.entry(stId, stSide == 1 ? strategy.long : strategy.short, qty=stQty)
     if stTP1ClosePct < 100
@@ -1798,7 +1831,7 @@ if stNewPackage and stState == 0 and strategy.position_size == 0
 st_r_text(_r) =>
     (_r >= 0 ? '+' : '') + str.tostring(_r, '#.##') + 'R'
 
-var table stTable = table.new(stTablePosition, 2, 11, border_width=1)
+var table stTable = table.new(stTablePosition, 2, 12, border_width=1)
 st_row(_row, _name, _value, _bg) =>
     table.cell(stTable, 0, _row, _name, text_color=color.white, bgcolor=color.new(color.black, 15), text_size=size.small)
     table.cell(stTable, 1, _row, _value, text_color=color.white, bgcolor=_bg, text_size=size.small)
@@ -1806,15 +1839,17 @@ st_row(_row, _name, _value, _bg) =>
 // A strategy only calculates on confirmed bars: draw on the last confirmed history bar too.
 if (barstate.islast or barstate.islastconfirmedhistory) and stShowTable
     _closed = stWins + stLosses
-    table.cell(stTable, 0, 0, 'STRATEGY TESTER (V7.6)', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.small)
-    table.cell(stTable, 1, 0, stTfOk ? 'your rules: TP1/TP2 = WIN, SL first = LOSS' : 'Switch chart to 5m', text_color=color.white, bgcolor=stTfOk ? color.new(color.green, 55) : color.new(color.red, 35), text_size=size.small)
+    _all = stWins + stLosses + stBEs
+    table.cell(stTable, 0, 0, 'STRATEGY TESTER (V7.7)', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.small)
+    table.cell(stTable, 1, 0, stTfOk ? 'your rules: TP1/TP2 = WIN, SL first = LOSS, BE = neither' : 'Switch chart to 5m', text_color=color.white, bgcolor=stTfOk ? color.new(color.green, 55) : color.new(color.red, 35), text_size=size.small)
     st_row(1, 'History tested', str.format_time(stFirstTime, 'yyyy-MM-dd') + ' → ' + str.format_time(time, 'yyyy-MM-dd') + ' (' + str.tostring(stDays) + ' days)', color.new(color.gray, 75))
     st_row(2, 'Trades (per day)', str.tostring(stTrades) + ' (' + (stDays > 0 ? str.tostring(float(stTrades) / stDays, '#.##') : '—') + ')' + (stState == 1 ? ' | 1 open' : ''), color.new(color.gray, 75))
-    st_row(3, 'Wins / losses', str.tostring(stWins) + ' / ' + str.tostring(stLosses) + ' | TP2 ' + str.tostring(stWinsTP2), color.new(color.gray, 75))
-    st_row(4, 'Win rate (TP1 before SL)', _closed > 0 ? str.tostring(100.0 * stWins / _closed, '#.#') + '%' : '—', _closed == 0 ? color.new(color.gray, 75) : color.new(color.teal, 45))
+    st_row(3, 'Wins / losses / break-even', str.tostring(stWins) + ' / ' + str.tostring(stLosses) + ' / ' + str.tostring(stBEs) + ' | TP2 ' + str.tostring(stWinsTP2), color.new(color.gray, 75))
+    st_row(4, 'Win rate: W/(W+L) | W/all', _closed > 0 ? str.tostring(100.0 * stWins / _closed, '#.#') + '% | ' + str.tostring(100.0 * stWins / _all, '#.#') + '%' : '—', _closed == 0 ? color.new(color.gray, 75) : color.new(color.teal, 45))
     st_row(5, 'Net R (before costs)', st_r_text(stNetR), stNetR >= 0 ? color.new(color.green, 55) : color.new(color.red, 55))
     st_row(6, 'Max drawdown (R)', str.tostring(stMaxDDR, '#.##') + 'R', color.new(color.gray, 75))
     st_row(7, 'Net profit $ (after costs)', str.tostring(strategy.netprofit, '#,###.##') + ' | risk $' + str.tostring(stRiskUSD, '#'), strategy.netprofit >= 0 ? color.new(color.green, 55) : color.new(color.red, 55))
     st_row(8, 'Profit factor $', strategy.grossloss > 0 ? str.tostring(strategy.grossprofit / strategy.grossloss, '#.##') : '—', color.new(color.gray, 75))
     st_row(9, 'Max drawdown $', str.tostring(strategy.max_drawdown, '#,###.##'), color.new(color.gray, 75))
-    st_row(10, 'Close at TP1', str.tostring(stTP1ClosePct) + '%' + (stTP1ClosePct < 100 ? ' | runner keeps the original SL' : ''), color.new(color.gray, 75))
+    st_row(10, 'Close at TP1', str.tostring(stTP1ClosePct) + '%' + (stTP1ClosePct < 100 ? ' | runner to TP2' : ''), color.new(color.gray, 75))
+    st_row(11, 'Break-even', stBeMode + (stBeMode == 'Before TP1 at +R' ? ' ' + str.tostring(stBeTriggerR, '#.##') + 'R' : '') + (stBeOffsetR > 0 ? ' | offset ' + str.tostring(stBeOffsetR, '#.##') + 'R' : ''), color.new(color.gray, 75))

@@ -4,11 +4,16 @@
 // Runs the trades that "1. Signal Engine" builds. Map its ten source inputs to the
 // identically named hidden BRIDGE_* plots of the Signal Engine.
 //   Entry    : at the trigger candle close.
-//   TP1      : 50% closed = WIN. The runner keeps the original stop (no break-even)
-//              and targets TP2; if it is stopped later the trade is still a WIN.
-//   Loss     : stop hit before TP1 (stop first when one candle touches both).
+//   TP1      : 50% closed = WIN. The runner targets TP2; if it is stopped later the
+//              trade is still a WIN.
+//   Break-even (V7.7, input): Off / After TP1 / Before TP1 at +X R (default +0.75R).
+//              Once armed (on a bar close) the stop sits at entry from the next bar.
+//              A trade stopped at break-even before TP1 is BE: neither win nor loss.
+//   Loss     : original stop hit before TP1 and before break-even (stop first when
+//              one candle touches both).
 //   Chart    : entry/SL/TP1/TP2 lines, result labels, a status table with the
-//              win/loss scoreboard, and alerts (new trade, TP1, win, loss).
+//              win / loss / break-even scoreboard, and alerts (new trade, TP1,
+//              break-even armed, win, loss, break-even exit).
 //
 //@version=5
 indicator(title="XAUUSD Smart Trade — 2. Trade Manager (Execution)", shorttitle="2. Trade Manager", overlay=true, max_lines_count=50, max_labels_count=50)
@@ -33,6 +38,9 @@ phase7ShowSignalUI = input.bool(true, 'Show Engine-7 signal UI', group='Engine 7
 phase7LabelOffset = input.int(3, 'Right label offset (bars)', minval=1, maxval=25, group='Engine 7 — Signal UI')
 phase7ShowDebug = input.bool(true, 'Show bridge/lifecycle debug', group='Engine 7 — Debug')
 phase7DebugPosition = input.string(position.top_right, 'Table position', options=[position.top_right, position.top_left, position.bottom_right, position.bottom_left], group='Engine 7 — Debug')
+phase7BeMode = input.string('Before TP1 at +R', 'Break-even', options=['Off', 'After TP1', 'Before TP1 at +R'], group='Engine 7 — Break-even', tooltip='Before TP1 at +R: once price has moved the trigger distance in favour (bar high/low, checked at the bar close), the stop moves to entry from the next bar; a later stop there is BE (not a win, not a loss). After TP1: only the runner stop moves to entry. Measured on the latest 6 months with the V7.6 signals: Off 81.2% wins/(wins+losses), +28.3R; +0.75R 84.0% with 8 of 33 trades BE, +25.1R; After TP1 81.2%, +30.3R. On 2024-01..2026-04 the +0.75R setting did not raise the win rate (53.7% vs 55.0%) and cut profit from +86R to +46R.')
+phase7BeTriggerR = input.float(0.75, 'Break-even trigger (R in favour, before TP1)', minval=0.1, maxval=1.5, step=0.05, group='Engine 7 — Break-even')
+phase7BeOffsetR = input.float(0.0, 'Break-even stop offset (R beyond entry)', minval=0.0, maxval=0.5, step=0.05, group='Engine 7 — Break-even', tooltip='0 = exactly at entry. A small offset (e.g. 0.05R) can cover spread/commission.')
 
 // META layout (protocol v7.2): 70,000,000,000 base + valid + side + entry code
 // (1 = trigger close) + TP1 code + TP2 code (R multiple x 10, floored) + reason. Dedicated
@@ -152,10 +160,10 @@ var array<line> phase7History2Lines = array.new_line()
 var array<label> phase7History2Labels = array.new_label()
 
 // 0 = NO_TRADE, 1 = LIVE_TRADE. A package goes live at its trigger close.
-// Win/loss rule: reaching TP1 (or TP2) is a WIN; a stop before TP1 is a LOSS.
-// There is no break-even: at TP1 half the position is closed and the other half
-// keeps the original stop and targets TP2. If that runner is stopped later, the
-// trade is still a WIN (TP1 was reached) and it is never shown as an SL hit.
+// Win/loss rule: reaching TP1 (or TP2) is a WIN; the original stop before TP1 is a
+// LOSS; a break-even stop before TP1 is BE (neither). At TP1 half the position is
+// closed and the other half targets TP2; if that runner is stopped later (at the
+// original stop, or at entry once break-even is armed) the trade is still a WIN.
 // When one candle touches both the stop and a target the stop is taken first.
 var int phase7StateCode = 0
 var int phase7LastProcessedEvalId = na
@@ -177,6 +185,10 @@ var string phase7LastStatus = 'NO_TRADE'
 var string phase7LastEvent = 'NONE'
 var int phase7Wins = 0
 var int phase7Losses = 0
+var int phase7BEs = 0
+var bool phase7BeArmed = false
+var bool phase7NewBE = false
+var bool phase7NewBeArmed = false
 var int phase7WinsTP2 = 0
 var float phase7NetR = 0.0
 var bool phase7NewTrade = false
@@ -188,31 +200,42 @@ phase7NewTrade := false
 phase7NewTP1 := false
 phase7NewWin := false
 phase7NewLoss := false
+phase7NewBE := false
+phase7NewBeArmed := false
 
 // Manage the live trade first, then consume a new evaluation. This allows a
 // same-bar close followed by a new trade, while a busy lifecycle ignores READY.
 if phase7ExecutionTfOk and barstate.isconfirmed and phase7StateCode == 1 and bar_index > phase7FillBarIndex
-    phase7StopHitNow = phase7Side == 1 ? low <= phase7SL : high >= phase7SL
+    float phase7RiskNow = math.abs(phase7Entry - phase7SL)
+    float phase7BeLevel = phase7Entry + phase7Side * phase7BeOffsetR * phase7RiskNow
+    float phase7StopNow = phase7BeArmed ? phase7BeLevel : phase7SL
+    phase7StopHitNow = phase7Side == 1 ? low <= phase7StopNow : high >= phase7StopNow
     phase7TP1HitNow = phase7Side == 1 ? high >= phase7TP1 : low <= phase7TP1
     phase7TP2HitNow = phase7Side == 1 ? high >= phase7TP2 : low <= phase7TP2
     if phase7StopHitNow or phase7TP2HitNow
         bool phase7IsWin = phase7TP1Hit or not phase7StopHitNow
-        float phase7TradeR = not phase7IsWin ? -1.0 : phase7StopHitNow ? 0.5 * phase7TP1R - 0.5 : 0.5 * phase7TP1R + 0.5 * phase7TP2R
-        phase7Reason := not phase7IsWin ? 'LOSS_SL' : phase7StopHitNow ? 'WIN_TP1' : 'WIN_TP2'
-        phase7LastStatus := phase7IsWin ? 'CLOSED_WIN' : 'CLOSED_LOSS'
+        bool phase7IsBE = not phase7IsWin and phase7BeArmed
+        float phase7RunnerR = phase7BeArmed ? phase7BeOffsetR : -1.0
+        float phase7TradeR = phase7IsBE ? phase7BeOffsetR : not phase7IsWin ? -1.0 : phase7StopHitNow ? 0.5 * phase7TP1R + 0.5 * phase7RunnerR : 0.5 * phase7TP1R + 0.5 * phase7TP2R
+        phase7Reason := phase7IsBE ? 'BREAK_EVEN' : not phase7IsWin ? 'LOSS_SL' : phase7StopHitNow ? 'WIN_TP1' : 'WIN_TP2'
+        phase7LastStatus := phase7IsWin ? 'CLOSED_WIN' : phase7IsBE ? 'CLOSED_BE' : 'CLOSED_LOSS'
         phase7LastEvent := phase7Reason
         phase7Wins += phase7IsWin ? 1 : 0
+        phase7BEs += phase7IsBE ? 1 : 0
         phase7WinsTP2 += phase7IsWin and not phase7StopHitNow ? 1 : 0
-        phase7Losses += phase7IsWin ? 0 : 1
+        phase7Losses += phase7IsWin or phase7IsBE ? 0 : 1
         phase7NetR += phase7TradeR
         phase7NewWin := phase7IsWin
-        phase7NewLoss := not phase7IsWin
+        phase7NewBE := phase7IsBE
+        phase7NewLoss := not phase7IsWin and not phase7IsBE
         if phase7ShowSignalUI and array.size(phase7CurrentLabels) == 4
             _sideText = phase7Side == 1 ? 'LONG ' : 'SHORT '
-            _resultText = phase7Reason == 'LOSS_SL' ? '✕ ' + _sideText + 'LOSS ' : phase7Reason == 'WIN_TP2' ? '✓ ' + _sideText + 'WIN — TP2 ' : '✓ ' + _sideText + 'WIN — TP1 (runner closed) '
+            _resultText = phase7Reason == 'LOSS_SL' ? '✕ ' + _sideText + 'LOSS ' : phase7Reason == 'BREAK_EVEN' ? '◎ ' + _sideText + 'BREAK-EVEN ' : phase7Reason == 'WIN_TP2' ? '✓ ' + _sideText + 'WIN — TP2 ' : '✓ ' + _sideText + 'WIN — TP1 (runner closed) '
             label.set_text(array.get(phase7CurrentLabels, 0), _resultText + phase7_r_text(phase7TradeR) + ' | entry ' + str.tostring(phase7Entry, format.mintick))
             if phase7Reason == 'LOSS_SL'
                 label.set_text(array.get(phase7CurrentLabels, 1), 'SL ✕ HIT ' + str.tostring(phase7SL, format.mintick) + ' | -1R')
+            if phase7Reason == 'BREAK_EVEN'
+                label.set_text(array.get(phase7CurrentLabels, 1), 'BE stop hit ' + str.tostring(phase7BeLevel, format.mintick) + ' | ' + phase7_r_text(phase7BeOffsetR) + ' (not a loss)')
             if phase7Reason == 'WIN_TP2'
                 label.set_text(array.get(phase7CurrentLabels, 2), 'TP1 ✓ HIT ' + str.tostring(phase7TP1, format.mintick) + ' | ' + phase7_r_text(phase7TP1R))
                 label.set_text(array.get(phase7CurrentLabels, 3), 'TP2 ✓ HIT ' + str.tostring(phase7TP2, format.mintick) + ' | ' + phase7_r_text(phase7TP2R))
@@ -233,7 +256,20 @@ if phase7ExecutionTfOk and barstate.isconfirmed and phase7StateCode == 1 and bar
         phase7NewTP1 := true
         if phase7ShowSignalUI and array.size(phase7CurrentLabels) == 4
             label.set_text(array.get(phase7CurrentLabels, 2), 'TP1 ✓ HIT — WIN ' + str.tostring(phase7TP1, format.mintick) + ' | ' + phase7_r_text(phase7TP1R) + ' (50% closed)')
-            label.set_text(array.get(phase7CurrentLabels, 1), 'Runner stop ' + str.tostring(phase7SL, format.mintick) + ' (trade already a WIN)')
+            label.set_text(array.get(phase7CurrentLabels, 1), 'Runner stop ' + str.tostring(phase7StopNow, format.mintick) + ' (trade already a WIN)')
+    // Arm break-even on this bar's close; the stop moves to entry from the next bar.
+    if phase7StateCode == 1 and not phase7BeArmed and phase7BeMode != 'Off'
+        float _favour = phase7Side == 1 ? high - phase7Entry : phase7Entry - low
+        bool _arm = phase7BeMode == 'After TP1' ? phase7TP1Hit : phase7TP1Hit or _favour >= phase7BeTriggerR * phase7RiskNow
+        if _arm
+            phase7BeArmed := true
+            phase7NewBeArmed := true
+            phase7LastEvent := 'BE_ARMED'
+            if phase7ShowSignalUI and array.size(phase7CurrentLabels) == 4
+                line.set_y1(array.get(phase7CurrentLines, 1), phase7BeLevel)
+                line.set_y2(array.get(phase7CurrentLines, 1), phase7BeLevel)
+                label.set_y(array.get(phase7CurrentLabels, 1), phase7BeLevel)
+                label.set_text(array.get(phase7CurrentLabels, 1), 'SL → BE ' + str.tostring(phase7BeLevel, format.mintick) + (phase7TP1Hit ? ' (trade already a WIN)' : ' (armed at +' + str.tostring(phase7BeTriggerR, '#.##') + 'R)'))
 
 if phase7ShowSignalUI and phase7StateCode == 1
     phase7_update_visual(phase7CurrentLines, phase7CurrentLabels, bar_index)
@@ -257,6 +293,7 @@ if phase7NewEvaluation
         phase7TP2R := math.abs(phase7TP2 - phase7Entry) / math.abs(phase7Entry - phase7SL)
         phase7FillBarIndex := bar_index
         phase7TP1Hit := false
+        phase7BeArmed := false
         phase7Reason := 'VALID_TRADE'
         phase7LastStatus := 'LIVE_TRADE'
         phase7LastEvent := 'TRADE_OPENED'
@@ -272,14 +309,16 @@ phase7State = phase7StateCode == 0 ? 'NO_TRADE' : 'LIVE_TRADE'
 phase7TradeValid = phase7StateCode == 1
 
 alertcondition(phase7NewTrade, 'Engine 7 new trade', 'Engine 7 opened a trade at the trigger candle close. Entry/SL/TP1/TP2 are on the chart.')
-alertcondition(phase7NewTP1, 'Engine 7 TP1 hit (win)', 'Engine 7 TP1 reached: trade is a WIN, 50% closed, runner keeps the original stop.')
+alertcondition(phase7NewTP1, 'Engine 7 TP1 hit (win)', 'Engine 7 TP1 reached: trade is a WIN, 50% closed, runner continues to TP2.')
 alertcondition(phase7NewWin, 'Engine 7 trade closed as win', 'Engine 7 trade closed as a WIN (TP2, or runner closed after TP1).')
-alertcondition(phase7NewLoss, 'Engine 7 trade closed as loss', 'Engine 7 trade closed at the stop before TP1 (LOSS).')
+alertcondition(phase7NewLoss, 'Engine 7 trade closed as loss', 'Engine 7 trade closed at the original stop before TP1 (LOSS).')
+alertcondition(phase7NewBeArmed, 'Engine 7 break-even armed', 'Engine 7 moved the stop to entry (break-even armed).')
+alertcondition(phase7NewBE, 'Engine 7 trade closed at break-even', 'Engine 7 trade closed at the break-even stop before TP1 (BE: not a win, not a loss).')
 
 phase7_price_text(_price) =>
     na(_price) ? '—' : str.tostring(_price, format.mintick)
 
-var table phase7DebugTable = table.new(phase7DebugPosition, 2, 11, border_width=1)
+var table phase7DebugTable = table.new(phase7DebugPosition, 2, 12, border_width=1)
 phase7_debug_row(_row, _name, _value, _background) =>
     table.cell(phase7DebugTable, 0, _row, _name, text_color=color.white, bgcolor=color.new(color.black, 15), text_size=size.tiny)
     table.cell(phase7DebugTable, 1, _row, _value, text_color=color.white, bgcolor=_background, text_size=size.tiny)
@@ -287,6 +326,7 @@ phase7_debug_row(_row, _name, _value, _background) =>
 if barstate.islast
     if phase7ShowDebug
         _closed = phase7Wins + phase7Losses
+        _all = phase7Wins + phase7Losses + phase7BEs
         table.cell(phase7DebugTable, 0, 0, 'TRADE MANAGER', text_color=color.white, bgcolor=color.new(color.purple, 20), text_size=size.tiny)
         table.cell(phase7DebugTable, 1, 0, not phase7ExecutionTfOk ? 'Switch chart to 5m' : phase7BridgeConnected ? 'All 10 sources connected' : 'Check all 10 Brain sources', text_color=color.white, bgcolor=phase7ExecutionTfOk and phase7BridgeConnected ? color.new(color.green, 55) : color.new(color.red, 35), text_size=size.tiny)
         phase7_debug_row(1, 'State / last', phase7State + ' / ' + phase7LastStatus, phase7StateCode == 1 ? color.new(color.green, 35) : color.new(color.gray, 75))
@@ -295,9 +335,10 @@ if barstate.islast
         phase7_debug_row(4, 'Impulse A / B', phase7_price_text(phase7ImpulseA) + ' / ' + phase7_price_text(phase7ImpulseB), color.new(color.gray, 75))
         phase7_debug_row(5, 'Impulse / ATR', na(phase7ImpulseStrength) ? '—' : str.tostring(phase7ImpulseStrength, '#.##') + 'x', color.new(color.gray, 75))
         phase7_debug_row(6, 'Side / entry', (phase7Side == 1 ? 'LONG ' : phase7Side == -1 ? 'SHORT ' : 'NONE ') + phase7_price_text(phase7Entry), color.new(color.blue, 60))
-        phase7_debug_row(7, 'SL / risk', phase7_price_text(phase7SL) + (na(phase7SL) or na(phase7Entry) ? '' : ' | $' + str.tostring(math.abs(phase7Entry - phase7SL), '#.##')) + (phase7TP1Hit and phase7StateCode == 1 ? ' | TP1 done' : ''), color.new(color.red, 60))
+        phase7_debug_row(7, 'SL / risk', phase7_price_text(phase7SL) + (na(phase7SL) or na(phase7Entry) ? '' : ' | $' + str.tostring(math.abs(phase7Entry - phase7SL), '#.##')) + (phase7BeArmed and phase7StateCode == 1 ? ' | BE armed' : '') + (phase7TP1Hit and phase7StateCode == 1 ? ' | TP1 done' : ''), color.new(color.red, 60))
         phase7_debug_row(8, 'TP1 / R', phase7_price_text(phase7TP1) + (na(phase7TP1R) ? '' : ' | ' + phase7_r_text(phase7TP1R)) + (phase7TP1Hit ? ' ✓' : ''), color.new(color.orange, 55))
         phase7_debug_row(9, 'TP2 / R', phase7_price_text(phase7TP2) + (na(phase7TP2R) ? '' : ' | ' + phase7_r_text(phase7TP2R)), color.new(color.teal, 55))
-        phase7_debug_row(10, 'Chart results W/L', str.tostring(phase7Wins) + ' / ' + str.tostring(phase7Losses) + (_closed > 0 ? ' | WR ' + str.tostring(100.0 * phase7Wins / _closed, '#') + '% | TP2 ' + str.tostring(phase7WinsTP2) + ' | ' + phase7_r_text(phase7NetR) : ''), _closed == 0 ? color.new(color.gray, 75) : phase7NetR >= 0 ? color.new(color.green, 55) : color.new(color.red, 55))
+        phase7_debug_row(10, 'Chart results W/L/BE', str.tostring(phase7Wins) + ' / ' + str.tostring(phase7Losses) + ' / ' + str.tostring(phase7BEs) + (_closed > 0 ? ' | WR ' + str.tostring(100.0 * phase7Wins / _closed, '#') + '% (all ' + str.tostring(100.0 * phase7Wins / _all, '#') + '%) | TP2 ' + str.tostring(phase7WinsTP2) + ' | ' + phase7_r_text(phase7NetR) : ''), _closed == 0 ? color.new(color.gray, 75) : phase7NetR >= 0 ? color.new(color.green, 55) : color.new(color.red, 55))
+        phase7_debug_row(11, 'Break-even', phase7BeMode + (phase7BeMode == 'Before TP1 at +R' ? ' ' + str.tostring(phase7BeTriggerR, '#.##') + 'R' : '') + (phase7BeOffsetR > 0 ? ' | offset ' + str.tostring(phase7BeOffsetR, '#.##') + 'R' : ''), color.new(color.gray, 75))
     else
-        table.clear(phase7DebugTable, 0, 0, 1, 10)
+        table.clear(phase7DebugTable, 0, 0, 1, 11)
